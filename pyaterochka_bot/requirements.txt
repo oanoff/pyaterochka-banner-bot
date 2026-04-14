@@ -1,0 +1,6 @@
+python-telegram-bot==20.3
+Pillow==10.0.0
+pytesseract==0.3.10
+opencv-python==4.8.0.74
+numpy==1.24.3
+colorthief==0.2.1
