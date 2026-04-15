@@ -45,40 +45,46 @@ TEXTURE_THRESHOLD = 30
 
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# ---------- УЛУЧШЕННАЯ ПРЕДОБРАБОТКА ДЛЯ OCR ----------
+# ---------- УЛУЧШЕННАЯ ПРЕДОБРАБОТКА ДЛЯ OCR (ЩАДЯЩАЯ) ----------
 def preprocess_image_for_ocr(pil_image):
     """
-    Подготавливает изображение для наилучшего распознавания Tesseract.
+    Подготавливает изображение для распознавания Tesseract:
+    - Увеличивает в 2 раза.
+    - Корректирует перекос (deskew).
+    - Небольшое повышение контраста.
     Возвращает обработанное изображение (PIL Image).
     """
-    # Конвертируем в OpenCV формат
+    # Конвертируем в OpenCV
     img_cv = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
 
-    # 1. Перевод в оттенки серого
+    # Увеличиваем в 2 раза
+    h, w = img_cv.shape[:2]
+    img_cv = cv2.resize(img_cv, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
+    # В оттенки серого
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
 
-    # 2. Увеличение контраста с помощью CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast = clahe.apply(gray)
+    # Коррекция перекоса (deskew)
+    coords = np.column_stack(np.where(gray < 250))
+    if len(coords) > 100:
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        (h, w) = gray.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        gray = cv2.warpAffine(gray, M, (w, h),
+                              flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_REPLICATE)
 
-    # 3. Удаление шумов (небольшое размытие)
-    denoised = cv2.medianBlur(contrast, 3)
-
-    # 4. Адаптивная бинаризация (делаем текст чётким)
-    binary = cv2.adaptiveThreshold(
-        denoised, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        11,  # размер окна
-        2    # константа вычитания
-    )
-
-    # 5. Морфологические операции для улучшения связности текста
-    kernel = np.ones((2, 2), np.uint8)
-    processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    # Лёгкое повышение контраста
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
 
     # Обратно в PIL
-    return Image.fromarray(processed)
+    return Image.fromarray(gray)
 
 def get_ocr_data(pil_image):
     """
@@ -88,17 +94,15 @@ def get_ocr_data(pil_image):
     if not TESSERACT_AVAILABLE:
         return "", {}
 
-    # Предобработка
     processed_img = preprocess_image_for_ocr(pil_image)
 
-    # Распознавание с русским и английским языками
     try:
-        # Получаем детальные данные (для bounding box)
+        # Получаем детальные данные
         data = pytesseract.image_to_data(
             processed_img,
             lang='rus+eng',
             output_type=pytesseract.Output.DICT,
-            config='--psm 6'  # предполагаем единый блок текста
+            config='--psm 6'  # единый блок текста
         )
         text = pytesseract.image_to_string(
             processed_img,
@@ -110,7 +114,7 @@ def get_ocr_data(pil_image):
         logger.error(f"OCR error: {e}")
         return "", {}
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (БЕЗ ИЗМЕНЕНИЙ) ----------
 def rgb_to_hsl(r, g, b):
     r, g, b = r/255.0, g/255.0, b/255.0
     mx = max(r, g, b)
@@ -270,20 +274,24 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     if not results["aspect_ratio_ok"]:
         results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-    # OCR с улучшенной предобработкой
+    # OCR с щадящей предобработкой
     text, ocr_data = get_ocr_data(img_pil)
     results["ocr_text"] = text
 
-    # Площадь текстового блока и цвет (если есть данные)
+    # Площадь текстового блока и цвет
     text_area_percent = 0
     if TESSERACT_AVAILABLE and text and ocr_data:
         try:
             boxes = 0
             total_area = results["width"] * results["height"]
+            scale_factor = 2  # потому что мы увеличивали в 2 раза
             n_boxes = len(ocr_data['text'])
             for i in range(n_boxes):
                 if int(ocr_data['conf'][i]) > 30:
-                    x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
+                    x = ocr_data['left'][i] // scale_factor
+                    y = ocr_data['top'][i] // scale_factor
+                    w = ocr_data['width'][i] // scale_factor
+                    h = ocr_data['height'][i] // scale_factor
                     boxes += w * h
             text_area_percent = (boxes / total_area) * 100 if total_area else 0
             results["text_block_area_ok"] = text_area_percent <= MAX_TEXT_AREA_PERCENT
@@ -303,9 +311,13 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
         text_color_issues = []
         try:
             n_boxes = len(ocr_data['text'])
+            scale_factor = 2
             for i in range(n_boxes):
                 if int(ocr_data['conf'][i]) > 30:
-                    x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
+                    x = ocr_data['left'][i] // scale_factor
+                    y = ocr_data['top'][i] // scale_factor
+                    w = ocr_data['width'][i] // scale_factor
+                    h = ocr_data['height'][i] // scale_factor
                     if w > 0 and h > 0:
                         crop = img_pil.crop((x, y, x+w, y+h))
                         stat = ImageStat.Stat(crop)
@@ -435,7 +447,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен с улучшенным OCR...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (щадящий OCR)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
