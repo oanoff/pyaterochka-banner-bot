@@ -49,6 +49,9 @@ TEXTURE_THRESHOLD = 30
 # Файл с логотипом Пятёрочки
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
+# Допустимое отклонение цвета текста от эталона (евклидово расстояние в RGB)
+COLOR_TOLERANCE = 60
+
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def rgb_to_hsl(r, g, b):
     r, g, b = r/255.0, g/255.0, b/255.0
@@ -73,11 +76,40 @@ def hex_to_rgb(hex_color):
     hex_color = hex_color.lstrip('#')
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
+def color_distance(c1, c2):
+    """Евклидово расстояние между двумя RGB-цветами (0-441)."""
+    return np.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
+
 def is_color_allowed(rgb, bg_is_light):
-    if bg_is_light:
-        return rgb == hex_to_rgb(TEXT_COLOR_DARK)
-    else:
-        return rgb == hex_to_rgb(TEXT_COLOR_LIGHT)
+    """Проверяет, допустим ли цвет текста с учётом допуска."""
+    target = hex_to_rgb(TEXT_COLOR_DARK) if bg_is_light else hex_to_rgb(TEXT_COLOR_LIGHT)
+    return color_distance(rgb, target) <= COLOR_TOLERANCE
+
+def get_local_background_type(image, x, y, w, h):
+    """
+    Определяет, светлый или тёмный фон в области вокруг текста.
+    Возвращает True, если фон светлый (нужен тёмный текст), иначе False.
+    """
+    # Расширяем область вокруг текста, чтобы захватить фон
+    padding = 10
+    x1 = max(0, x - padding)
+    y1 = max(0, y - padding)
+    x2 = min(image.width, x + w + padding)
+    y2 = min(image.height, y + h + padding)
+    
+    # Если область слишком маленькая, берём больше
+    if (x2 - x1) < 5 or (y2 - y1) < 5:
+        x1, y1 = 0, 0
+        x2, y2 = image.width, image.height
+    
+    region = image.crop((x1, y1, x2, y2))
+    # Конвертируем в grayscale и считаем среднюю яркость
+    gray_region = region.convert('L')
+    stat = ImageStat.Stat(gray_region)
+    avg_brightness = stat.mean[0]
+    
+    # Если средняя яркость > 128, считаем фон светлым
+    return avg_brightness > 128
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -243,23 +275,28 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (упрощённо, только если есть OCR)
+    # Проверка цвета текста (улучшенная версия с локальным фоном и допуском)
     if TESSERACT_AVAILABLE and text:
-        bg_is_light = np.mean(img_pil.resize((100,100)).convert('L').getdata()) > 128
         text_color_issues = []
         try:
             data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
             for i in range(len(data['text'])):
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    crop = img_pil.crop((x, y, x+w, y+h))
-                    stat = ImageStat.Stat(crop)
-                    avg_color = tuple(map(int, stat.mean[:3]))
-                    if not is_color_allowed(avg_color, bg_is_light):
-                        text_color_issues.append(f"{avg_color}")
+                    if w > 0 and h > 0:
+                        # Определяем локальный фон вокруг этого текста
+                        local_bg_light = get_local_background_type(img_pil, x, y, w, h)
+                        crop = img_pil.crop((x, y, x+w, y+h))
+                        stat = ImageStat.Stat(crop)
+                        avg_color = tuple(map(int, stat.mean[:3]))
+                        if not is_color_allowed(avg_color, local_bg_light):
+                            expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
+                            text_color_issues.append(f"{avg_color} (ожидался {expected})")
             if text_color_issues:
                 results["text_color_ok"] = False
-                results["details"].append(f"⚠️ Цвет текста не соответствует гайду")
+                # Показываем не более 3 примеров, чтобы не засорять отчёт
+                examples = text_color_issues[:3]
+                results["details"].append(f"⚠️ Цвет текста не соответствует гайду. Примеры: {', '.join(examples)}")
             else:
                 results["text_color_ok"] = True
         except Exception as e:
