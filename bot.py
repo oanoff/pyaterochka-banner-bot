@@ -50,7 +50,7 @@ TEXTURE_THRESHOLD = 30
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
 # Допустимое отклонение цвета текста
-COLOR_TOLERANCE = 60
+COLOR_TOLERANCE = 100
 
 # Лимиты символов
 MAX_CHARS_XS_S = 45
