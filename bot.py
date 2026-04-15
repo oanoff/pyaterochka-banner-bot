@@ -166,7 +166,7 @@ def detect_logo_pyaterochka(image):
             break
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
-# ---------- ОСНОВНОЙ АНАЛИЗ (ПОЛНАЯ ВЕРСИЯ) ----------
+# ---------- ОСНОВНОЙ АНАЛИЗ ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
     results = {
         "file_size_ok": False,
@@ -340,8 +340,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
         results["text_rules_ok"] = True
         results["char_count_ok"] = True
 
-    # Доп. предупреждение
-    results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам")
+    # Доп. предупреждение с кликабельной ссылкой
+    results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам. Свяжитесь с [Николаем Кучкаровым](https://t.me/samuraydesign).")
 
     # Вердикт
     critical = ["file_size_ok", "format_ok", "dimensions_ok", "aspect_ratio_ok",
@@ -434,7 +434,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (рекомендация отправки файлом)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (рекомендация отправки файлом, ссылка на дизайнера)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
