@@ -49,7 +49,7 @@ TEXTURE_THRESHOLD = 30
 # Файл с логотипом Пятёрочки
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# Допустимое отклонение цвета текста
+# Допустимое отклонение цвета текста (увеличено для белого)
 COLOR_TOLERANCE = 100
 
 # Лимиты символов
@@ -258,7 +258,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (улучшенная версия с маской и гистограммой фона)
+    # Проверка цвета текста (исправлено: увеличен допуск + мода вместо медианы)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -279,7 +279,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
                         peak_brightness = hist.index(peak) if peak > 0 else 128
                         local_bg_light = peak_brightness > 128
 
-                        # ----- Получение чистого цвета текста через маску -----
+                        # ----- Получение цвета текста (мода) -----
                         crop = img_pil.crop((x, y, x+w, y+h))
                         crop_gray = crop.convert('L')
                         _, mask = cv2.threshold(np.array(crop_gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -295,10 +295,14 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
                         text_pixels = crop_np[text_pixels_mask]
 
                         if len(text_pixels) > 10:
-                            median_color = tuple(np.median(text_pixels, axis=0).astype(int))
-                            if not is_color_allowed(median_color, local_bg_light):
+                            # Находим наиболее частый цвет (моду)
+                            rounded = (text_pixels // 5) * 5
+                            unique, counts = np.unique(rounded, axis=0, return_counts=True)
+                            mode_color = unique[np.argmax(counts)]
+                            mode_color = tuple(mode_color.astype(int))
+                            if not is_color_allowed(mode_color, local_bg_light):
                                 expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
-                                text_color_issues.append(f"{median_color} (ожидался {expected})")
+                                text_color_issues.append(f"{mode_color} (ожидался {expected})")
                         else:
                             stat = ImageStat.Stat(crop)
                             avg_color = tuple(map(int, stat.mean[:3]))
