@@ -1,14 +1,16 @@
-# Используем официальный лёгкий образ Python 3.11
-FROM python:3.11-slim
+# Используем официальный образ Python 3.11 (не slim, чтобы избежать проблем с зависимостями)
+FROM python:3.11
 
 # Устанавливаем системные зависимости, включая Tesseract OCR и русский язык
-RUN apt-get update && apt-get install -y \
+# Добавлен флаг --fix-missing для обхода возможных сетевых ошибок
+RUN apt-get update --fix-missing && \
+    apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-rus \
     libgl1-mesa-glx \
-    libglib2.0-0 \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    libglib2.0-0 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Создаём рабочую директорию
 WORKDIR /app
