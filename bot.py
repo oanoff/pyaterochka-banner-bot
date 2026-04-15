@@ -38,8 +38,8 @@ ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
 TEXT_COLOR_DARK = "#302E33"
 TEXT_COLOR_LIGHT = "#FFFFFF"
 
-# Максимальная площадь текстового блока (%)
-MAX_TEXT_AREA_PERCENT = 40
+# Максимальная площадь текстового блока (%) – обновлено до 52%
+MAX_TEXT_AREA_PERCENT = 52
 
 # Пороги для определения "плохого" фона
 MIN_SATURATION_ACID = 50
@@ -52,10 +52,10 @@ LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 # Допустимое отклонение цвета текста
 COLOR_TOLERANCE = 60
 
-# ---------- НОВЫЕ ЛИМИТЫ ПО СИМВОЛАМ (ВКЛЮЧАЯ ПРОБЕЛЫ) ----------
-MAX_CHARS_XS_S = 45      # для XS/S баннеров (1 предложение, до 2 строк)
-MAX_CHARS_TITLE_M_L = 30 # для заголовка M/L баннеров
-MAX_CHARS_SUBTITLE_M_L = 50 # для подзаголовка M/L баннеров
+# ---------- ЛИМИТЫ ПО СИМВОЛАМ (ВКЛЮЧАЯ ПРОБЕЛЫ) ----------
+MAX_CHARS_XS_S = 45
+MAX_CHARS_TITLE_M_L = 30
+MAX_CHARS_SUBTITLE_M_L = 50
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def rgb_to_hsl(r, g, b):
@@ -148,10 +148,6 @@ def check_text_styles(text):
     return issues
 
 def check_char_count(text, banner_type='auto'):
-    """
-    Проверка количества символов (включая пробелы).
-    banner_type: 'xs_s' или 'm_l'. Если 'auto', определяется по площади текста.
-    """
     char_count = len(text.strip())
     if banner_type == 'xs_s':
         if char_count > MAX_CHARS_XS_S:
@@ -166,8 +162,7 @@ def check_char_count(text, banner_type='auto'):
             return False, f"заголовок превышает {MAX_CHARS_TITLE_M_L} символов (сейчас {title_chars})"
         if subtitle_chars > MAX_CHARS_SUBTITLE_M_L:
             return False, f"подзаголовок превышает {MAX_CHARS_SUBTITLE_M_L} символов (сейчас {subtitle_chars})"
-    else:  # auto
-        # если текст короткий, считаем как xs_s, иначе как m_l
+    else:
         if char_count <= MAX_CHARS_XS_S + 10:
             return check_char_count(text, 'xs_s')
         else:
@@ -327,7 +322,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
         if not results["text_rules_ok"]:
             results["details"].extend([f"⚠️ {issue}" for issue in text_style_issues])
 
-        # Проверка символов (новая)
+        # Проверка символов
         banner_type = 'xs_s' if text_area_percent < 25 else 'm_l'
         char_ok, char_msg = check_char_count(text, banner_type)
         results["char_count_ok"] = char_ok
@@ -420,7 +415,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен с подсчётом символов...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен с обновлённой площадью текста 52%...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
