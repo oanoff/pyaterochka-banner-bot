@@ -3,7 +3,7 @@ import io
 import re
 import asyncio
 import logging
-from PIL import Image, ImageDraw, ImageStat
+from PIL import Image, ImageStat
 import cv2
 import numpy as np
 import pytesseract
@@ -11,14 +11,9 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from colorthief import ColorThief
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Попытка настроить Tesseract
 try:
     pytesseract.get_tesseract_version()
     TESSERACT_AVAILABLE = True
@@ -34,25 +29,19 @@ SIZE_TOLERANCE = 0.0
 MAX_FILE_SIZE_MB = 5
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
 
-# Текстовые цвета
 TEXT_COLOR_DARK = "#302E33"
 TEXT_COLOR_LIGHT = "#FFFFFF"
 
-# Максимальная площадь текстового блока (%)
 MAX_TEXT_AREA_PERCENT = 52
 
-# Пороги для определения "плохого" фона
 MIN_SATURATION_ACID = 50
 MAX_LIGHTNESS_PASTEL = 85
 TEXTURE_THRESHOLD = 30
 
-# Файл с логотипом Пятёрочки
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# Допустимое отклонение цвета текста
-COLOR_TOLERANCE = 150  # увеличенный допуск
+COLOR_TOLERANCE = 100  # для тёмного текста
 
-# Лимиты символов
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
 MAX_CHARS_SUBTITLE_M_L = 50
@@ -81,18 +70,30 @@ def hex_to_rgb(hex_color):
     hex_color = hex_color.lstrip('#')
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-def color_distance(c1, c2):
-    return np.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
+def luminance(rgb):
+    """Яркость по формуле ITU-R BT.709."""
+    return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+
+def is_light_color(rgb):
+    """Проверяет, является ли цвет светлым (близким к белому)."""
+    # Яркость > 180 и низкая насыщенность (разница между каналами < 50)
+    lum = luminance(rgb)
+    max_c = max(rgb)
+    min_c = min(rgb)
+    saturation = max_c - min_c
+    return lum > 180 and saturation < 60
+
+def is_dark_color_allowed(rgb):
+    """Проверяет, близок ли цвет к тёмно-серому #302E33."""
+    target = hex_to_rgb(TEXT_COLOR_DARK)
+    dist = np.sqrt(sum((a - b) ** 2 for a, b in zip(rgb, target)))
+    return dist <= COLOR_TOLERANCE
 
 def is_color_allowed(rgb, bg_is_light):
-    """Гибкая проверка цвета: для белого - проверка яркости, для тёмного - расстояние."""
     if bg_is_light:
-        # Ожидается тёмный текст (#302E33)
-        target = hex_to_rgb(TEXT_COLOR_DARK)
-        return color_distance(rgb, target) <= COLOR_TOLERANCE
+        return is_dark_color_allowed(rgb)
     else:
-        # Ожидается светлый текст (#FFFFFF) - проверяем, что все компоненты > 200
-        return all(c > 200 for c in rgb)
+        return is_light_color(rgb)
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -220,7 +221,6 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
         results["verdict"] = "Невозможно проверить"
         return results
 
-    # Размер и соотношение сторон
     results["dimensions_ok"] = (results["width"] == TARGET_WIDTH and results["height"] == TARGET_HEIGHT)
     if not results["dimensions_ok"]:
         results["details"].append(f"⚠️ Размер {results['width']}x{results['height']} не соответствует {TARGET_WIDTH}x{TARGET_HEIGHT}")
@@ -230,8 +230,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     if not results["aspect_ratio_ok"]:
         results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-    # OCR текста
     text = ""
+    gray = None
     if TESSERACT_AVAILABLE:
         try:
             img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
@@ -243,9 +243,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["details"].append("ℹ️ Tesseract OCR не установлен на сервере. Проверка текста отключена.")
 
-    # Площадь текстового блока
     text_area_percent = 0
-    if TESSERACT_AVAILABLE and text:
+    if TESSERACT_AVAILABLE and text and gray is not None:
         try:
             data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
             boxes = 0
@@ -264,8 +263,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (упрощённая и надёжная)
-    if TESSERACT_AVAILABLE and text:
+    # Проверка цвета текста (улучшенная)
+    if TESSERACT_AVAILABLE and text and gray is not None:
         text_color_issues = []
         try:
             data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
@@ -273,7 +272,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     if w > 5 and h > 5:
-                        # Определяем локальный фон (по яркости области вокруг)
+                        # Определяем локальный фон
                         padding = 15
                         x1 = max(0, x - padding)
                         y1 = max(0, y - padding)
@@ -283,9 +282,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
                         bg_mean = np.array(bg_region).mean()
                         local_bg_light = bg_mean > 128
 
-                        # Анализируем центральную область буквы (ядро)
+                        # Извлекаем центральную область букв
                         crop = img_pil.crop((x, y, x+w, y+h))
-                        # Берём центральные 60% области, чтобы избежать краёв
                         cw, ch = crop.size
                         core = crop.crop((int(cw*0.2), int(ch*0.2), int(cw*0.8), int(ch*0.8)))
                         if core.size[0] > 0 and core.size[1] > 0:
@@ -311,19 +309,17 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_color_ok"] = True
 
-    # Проверка фона
+    # Остальные проверки
     bg_issues = is_background_bad(img_pil)
     results["background_ok"] = len(bg_issues) == 0
     if not results["background_ok"]:
         results["details"].append(f"⚠️ Проблемы с фоном: {', '.join(bg_issues)}")
 
-    # Проверка логотипа
     logo_found, logo_msg = detect_logo_pyaterochka(img_pil)
     results["logo_ok"] = not logo_found
     if logo_found:
         results["details"].append(f"❌ {logo_msg}")
 
-    # Текстовые правила
     if TESSERACT_AVAILABLE and text:
         text_style_issues = check_text_styles(text)
         results["text_rules_ok"] = len(text_style_issues) == 0
@@ -339,10 +335,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
         results["text_rules_ok"] = True
         results["char_count_ok"] = True
 
-    # Доп. предупреждение
     results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам")
 
-    # Вердикт
     critical = ["file_size_ok", "format_ok", "dimensions_ok", "aspect_ratio_ok",
                 "text_block_area_ok", "text_color_ok", "background_ok", "logo_ok",
                 "text_rules_ok", "char_count_ok"]
