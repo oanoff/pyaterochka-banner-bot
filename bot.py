@@ -3,7 +3,7 @@ import io
 import re
 import asyncio
 import logging
-from PIL import Image, ImageDraw, ImageStat, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageStat
 import cv2
 import numpy as np
 import pytesseract
@@ -11,14 +11,14 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from colorthief import ColorThief
 
-# Настройка логирования
+# Настройка логирования (будет видно в панели Bothost)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Попытка настроить Tesseract
+# Попытка настроить Tesseract (если не найден, бот продолжит работу)
 try:
     pytesseract.get_tesseract_version()
     TESSERACT_AVAILABLE = True
@@ -30,91 +30,26 @@ except pytesseract.TesseractNotFoundError:
 TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
 ASPECT_RATIO = TARGET_WIDTH / TARGET_HEIGHT
-SIZE_TOLERANCE = 0.0
+SIZE_TOLERANCE = 0.0  # размер должен быть точным
 MAX_FILE_SIZE_MB = 5
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
 
+# Текстовые цвета
 TEXT_COLOR_DARK = "#302E33"
 TEXT_COLOR_LIGHT = "#FFFFFF"
 
+# Максимальная площадь текстового блока (%)
 MAX_TEXT_AREA_PERCENT = 40
 
+# Пороги для определения "плохого" фона
 MIN_SATURATION_ACID = 50
 MAX_LIGHTNESS_PASTEL = 85
 TEXTURE_THRESHOLD = 30
 
+# Файл с логотипом Пятёрочки
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# ---------- УЛУЧШЕННАЯ ПРЕДОБРАБОТКА ДЛЯ OCR (ЩАДЯЩАЯ) ----------
-def preprocess_image_for_ocr(pil_image):
-    """
-    Подготавливает изображение для распознавания Tesseract:
-    - Увеличивает в 2 раза.
-    - Корректирует перекос (deskew).
-    - Небольшое повышение контраста.
-    Возвращает обработанное изображение (PIL Image).
-    """
-    # Конвертируем в OpenCV
-    img_cv = cv2.cvtColor(np.array(pil_image.convert('RGB')), cv2.COLOR_RGB2BGR)
-
-    # Увеличиваем в 2 раза
-    h, w = img_cv.shape[:2]
-    img_cv = cv2.resize(img_cv, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-
-    # В оттенки серого
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-
-    # Коррекция перекоса (deskew)
-    coords = np.column_stack(np.where(gray < 250))
-    if len(coords) > 100:
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-        (h, w) = gray.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        gray = cv2.warpAffine(gray, M, (w, h),
-                              flags=cv2.INTER_CUBIC,
-                              borderMode=cv2.BORDER_REPLICATE)
-
-    # Лёгкое повышение контраста
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-
-    # Обратно в PIL
-    return Image.fromarray(gray)
-
-def get_ocr_data(pil_image):
-    """
-    Возвращает распознанный текст и словарь с данными о положении слов.
-    Использует улучшенную предобработку.
-    """
-    if not TESSERACT_AVAILABLE:
-        return "", {}
-
-    processed_img = preprocess_image_for_ocr(pil_image)
-
-    try:
-        # Получаем детальные данные
-        data = pytesseract.image_to_data(
-            processed_img,
-            lang='rus+eng',
-            output_type=pytesseract.Output.DICT,
-            config='--psm 6'  # единый блок текста
-        )
-        text = pytesseract.image_to_string(
-            processed_img,
-            lang='rus+eng',
-            config='--psm 6'
-        ).strip()
-        return text, data
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        return "", {}
-
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (БЕЗ ИЗМЕНЕНИЙ) ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def rgb_to_hsl(r, g, b):
     r, g, b = r/255.0, g/255.0, b/255.0
     mx = max(r, g, b)
@@ -274,24 +209,29 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     if not results["aspect_ratio_ok"]:
         results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-    # OCR с щадящей предобработкой
-    text, ocr_data = get_ocr_data(img_pil)
-    results["ocr_text"] = text
-
-    # Площадь текстового блока и цвет
-    text_area_percent = 0
-    if TESSERACT_AVAILABLE and text and ocr_data:
+    # OCR текста (только если Tesseract доступен)
+    text = ""
+    if TESSERACT_AVAILABLE:
         try:
+            img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+            text = pytesseract.image_to_string(gray, lang='rus+eng').strip()
+            results["ocr_text"] = text
+        except Exception as e:
+            results["details"].append(f"⚠️ Ошибка распознавания текста: {e}")
+    else:
+        results["details"].append("ℹ️ Tesseract OCR не установлен на сервере. Проверка текста отключена.")
+
+    # Проверка площади текстового блока и цвета (только если есть OCR)
+    text_area_percent = 0
+    if TESSERACT_AVAILABLE and text:
+        try:
+            data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
             boxes = 0
             total_area = results["width"] * results["height"]
-            scale_factor = 2  # потому что мы увеличивали в 2 раза
-            n_boxes = len(ocr_data['text'])
-            for i in range(n_boxes):
-                if int(ocr_data['conf'][i]) > 30:
-                    x = ocr_data['left'][i] // scale_factor
-                    y = ocr_data['top'][i] // scale_factor
-                    w = ocr_data['width'][i] // scale_factor
-                    h = ocr_data['height'][i] // scale_factor
+            for i in range(len(data['text'])):
+                if int(data['conf'][i]) > 30:
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     boxes += w * h
             text_area_percent = (boxes / total_area) * 100 if total_area else 0
             results["text_block_area_ok"] = text_area_percent <= MAX_TEXT_AREA_PERCENT
@@ -302,28 +242,21 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
             results["text_block_area_ok"] = True
     else:
         results["text_block_area_ok"] = True
-        if TESSERACT_AVAILABLE:
-            results["details"].append("ℹ️ Текст не распознан (возможно, его нет или он нечитаем)")
 
-    # Проверка цвета текста
-    if TESSERACT_AVAILABLE and text and ocr_data:
+    # Проверка цвета текста (упрощённо, только если есть OCR)
+    if TESSERACT_AVAILABLE and text:
         bg_is_light = np.mean(img_pil.resize((100,100)).convert('L').getdata()) > 128
         text_color_issues = []
         try:
-            n_boxes = len(ocr_data['text'])
-            scale_factor = 2
-            for i in range(n_boxes):
-                if int(ocr_data['conf'][i]) > 30:
-                    x = ocr_data['left'][i] // scale_factor
-                    y = ocr_data['top'][i] // scale_factor
-                    w = ocr_data['width'][i] // scale_factor
-                    h = ocr_data['height'][i] // scale_factor
-                    if w > 0 and h > 0:
-                        crop = img_pil.crop((x, y, x+w, y+h))
-                        stat = ImageStat.Stat(crop)
-                        avg_color = tuple(map(int, stat.mean[:3]))
-                        if not is_color_allowed(avg_color, bg_is_light):
-                            text_color_issues.append(f"{avg_color}")
+            data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
+            for i in range(len(data['text'])):
+                if int(data['conf'][i]) > 30:
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                    crop = img_pil.crop((x, y, x+w, y+h))
+                    stat = ImageStat.Stat(crop)
+                    avg_color = tuple(map(int, stat.mean[:3]))
+                    if not is_color_allowed(avg_color, bg_is_light):
+                        text_color_issues.append(f"{avg_color}")
             if text_color_issues:
                 results["text_color_ok"] = False
                 results["details"].append(f"⚠️ Цвет текста не соответствует гайду")
@@ -347,7 +280,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     if logo_found:
         results["details"].append(f"❌ {logo_msg}")
 
-    # Текстовые правила
+    # Текстовые правила (если есть текст)
     if TESSERACT_AVAILABLE and text:
         text_style_issues = check_text_styles(text)
         results["text_rules_ok"] = len(text_style_issues) == 0
@@ -364,8 +297,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
         results["text_rules_ok"] = True
         results["word_count_ok"] = True
 
-    # Доп. предупреждение
-    results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам")
+    # Доп. предупреждение о ручной проверке имиджа
+    results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам (оружие, мрачные темы и т.д.)")
 
     # Вердикт
     critical = ["file_size_ok", "format_ok", "dimensions_ok", "aspect_ratio_ok",
@@ -429,7 +362,7 @@ async def send_results(update: Update, results: dict):
         lines.append("\n📋 *Подробности:*")
         lines.extend([f"• {d}" for d in results['details']])
     if results.get('ocr_text'):
-        lines.append(f"\n📝 *Распознанный текст:*\n{results['ocr_text']}")
+        lines.append(f"\n📝 *Распознанный текст:*\n{results['ocr_text'][:200]}...")
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
@@ -447,7 +380,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (щадящий OCR)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
