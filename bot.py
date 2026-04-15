@@ -258,7 +258,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (исправлено: увеличен допуск + мода вместо медианы)
+    # Проверка цвета текста (упрощённый надёжный метод: ядро области)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -266,9 +266,9 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
             for i in range(len(data['text'])):
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    if w > 5 and h > 5:
-                        # ----- Определение локального фона (гистограммный метод) -----
-                        padding = 15
+                    if w > 10 and h > 10:
+                        # Определяем локальный фон по краям области
+                        padding = 10
                         x1 = max(0, x - padding)
                         y1 = max(0, y - padding)
                         x2 = min(img_pil.width, x + w + padding)
@@ -279,36 +279,20 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
                         peak_brightness = hist.index(peak) if peak > 0 else 128
                         local_bg_light = peak_brightness > 128
 
-                        # ----- Получение цвета текста (мода) -----
-                        crop = img_pil.crop((x, y, x+w, y+h))
-                        crop_gray = crop.convert('L')
-                        _, mask = cv2.threshold(np.array(crop_gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                        if local_bg_light:
-                            text_pixels_mask = mask < 128
-                        else:
-                            text_pixels_mask = mask > 128
+                        # Берём центральную часть области текста (50% по ширине и высоте)
+                        core_x = x + int(w * 0.25)
+                        core_y = y + int(h * 0.25)
+                        core_w = int(w * 0.5)
+                        core_h = int(h * 0.5)
+                        core = img_pil.crop((core_x, core_y, core_x + core_w, core_y + core_h))
 
-                        if np.sum(text_pixels_mask) < 5:
-                            text_pixels_mask = ~text_pixels_mask
+                        # Вычисляем средний цвет ядра
+                        stat = ImageStat.Stat(core)
+                        avg_color = tuple(map(int, stat.mean[:3]))
 
-                        crop_np = np.array(crop)
-                        text_pixels = crop_np[text_pixels_mask]
-
-                        if len(text_pixels) > 10:
-                            # Находим наиболее частый цвет (моду)
-                            rounded = (text_pixels // 5) * 5
-                            unique, counts = np.unique(rounded, axis=0, return_counts=True)
-                            mode_color = unique[np.argmax(counts)]
-                            mode_color = tuple(mode_color.astype(int))
-                            if not is_color_allowed(mode_color, local_bg_light):
-                                expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
-                                text_color_issues.append(f"{mode_color} (ожидался {expected})")
-                        else:
-                            stat = ImageStat.Stat(crop)
-                            avg_color = tuple(map(int, stat.mean[:3]))
-                            if not is_color_allowed(avg_color, local_bg_light):
-                                expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
-                                text_color_issues.append(f"{avg_color} (ожидался {expected})")
+                        if not is_color_allowed(avg_color, local_bg_light):
+                            expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
+                            text_color_issues.append(f"{avg_color} (ожидался {expected})")
 
             if text_color_issues:
                 results["text_color_ok"] = False
@@ -433,7 +417,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен с улучшенной проверкой цвета...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен с улучшенной проверкой цвета (ядро)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
