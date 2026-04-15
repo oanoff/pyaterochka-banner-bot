@@ -49,8 +49,8 @@ TEXTURE_THRESHOLD = 30
 # Файл с логотипом Пятёрочки
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# Допустимое отклонение цвета текста (увеличено для белого)
-COLOR_TOLERANCE = 100
+# Допустимое отклонение цвета текста
+COLOR_TOLERANCE = 150  # увеличенный допуск
 
 # Лимиты символов
 MAX_CHARS_XS_S = 45
@@ -85,8 +85,14 @@ def color_distance(c1, c2):
     return np.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
 
 def is_color_allowed(rgb, bg_is_light):
-    target = hex_to_rgb(TEXT_COLOR_DARK) if bg_is_light else hex_to_rgb(TEXT_COLOR_LIGHT)
-    return color_distance(rgb, target) <= COLOR_TOLERANCE
+    """Гибкая проверка цвета: для белого - проверка яркости, для тёмного - расстояние."""
+    if bg_is_light:
+        # Ожидается тёмный текст (#302E33)
+        target = hex_to_rgb(TEXT_COLOR_DARK)
+        return color_distance(rgb, target) <= COLOR_TOLERANCE
+    else:
+        # Ожидается светлый текст (#FFFFFF) - проверяем, что все компоненты > 200
+        return all(c > 200 for c in rgb)
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -258,7 +264,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (упрощённый надёжный метод: ядро области)
+    # Проверка цвета текста (упрощённая и надёжная)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -266,29 +272,28 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
             for i in range(len(data['text'])):
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    if w > 10 and h > 10:
-                        # Определяем локальный фон по краям области
-                        padding = 10
+                    if w > 5 and h > 5:
+                        # Определяем локальный фон (по яркости области вокруг)
+                        padding = 15
                         x1 = max(0, x - padding)
                         y1 = max(0, y - padding)
                         x2 = min(img_pil.width, x + w + padding)
                         y2 = min(img_pil.height, y + h + padding)
                         bg_region = img_pil.crop((x1, y1, x2, y2)).convert('L')
-                        hist = bg_region.histogram()
-                        peak = max(hist[30:225]) if len(hist) > 225 else 128
-                        peak_brightness = hist.index(peak) if peak > 0 else 128
-                        local_bg_light = peak_brightness > 128
+                        bg_mean = np.array(bg_region).mean()
+                        local_bg_light = bg_mean > 128
 
-                        # Берём центральную часть области текста (50% по ширине и высоте)
-                        core_x = x + int(w * 0.25)
-                        core_y = y + int(h * 0.25)
-                        core_w = int(w * 0.5)
-                        core_h = int(h * 0.5)
-                        core = img_pil.crop((core_x, core_y, core_x + core_w, core_y + core_h))
-
-                        # Вычисляем средний цвет ядра
-                        stat = ImageStat.Stat(core)
-                        avg_color = tuple(map(int, stat.mean[:3]))
+                        # Анализируем центральную область буквы (ядро)
+                        crop = img_pil.crop((x, y, x+w, y+h))
+                        # Берём центральные 60% области, чтобы избежать краёв
+                        cw, ch = crop.size
+                        core = crop.crop((int(cw*0.2), int(ch*0.2), int(cw*0.8), int(ch*0.8)))
+                        if core.size[0] > 0 and core.size[1] > 0:
+                            stat = ImageStat.Stat(core)
+                            avg_color = tuple(map(int, stat.mean[:3]))
+                        else:
+                            stat = ImageStat.Stat(crop)
+                            avg_color = tuple(map(int, stat.mean[:3]))
 
                         if not is_color_allowed(avg_color, local_bg_light):
                             expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
@@ -417,7 +422,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен с улучшенной проверкой цвета (ядро)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен с финальной проверкой цвета...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
