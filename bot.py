@@ -38,7 +38,7 @@ ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
 TEXT_COLOR_DARK = "#302E33"
 TEXT_COLOR_LIGHT = "#FFFFFF"
 
-# Максимальная площадь текстового блока (%) – обновлено до 52%
+# Максимальная площадь текстового блока (%)
 MAX_TEXT_AREA_PERCENT = 52
 
 # Пороги для определения "плохого" фона
@@ -52,7 +52,7 @@ LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 # Допустимое отклонение цвета текста
 COLOR_TOLERANCE = 60
 
-# ---------- ЛИМИТЫ ПО СИМВОЛАМ (ВКЛЮЧАЯ ПРОБЕЛЫ) ----------
+# Лимиты символов
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
 MAX_CHARS_SUBTITLE_M_L = 50
@@ -87,23 +87,6 @@ def color_distance(c1, c2):
 def is_color_allowed(rgb, bg_is_light):
     target = hex_to_rgb(TEXT_COLOR_DARK) if bg_is_light else hex_to_rgb(TEXT_COLOR_LIGHT)
     return color_distance(rgb, target) <= COLOR_TOLERANCE
-
-def get_local_background_type(image, x, y, w, h):
-    padding = 10
-    x1 = max(0, x - padding)
-    y1 = max(0, y - padding)
-    x2 = min(image.width, x + w + padding)
-    y2 = min(image.height, y + h + padding)
-    
-    if (x2 - x1) < 5 or (y2 - y1) < 5:
-        x1, y1 = 0, 0
-        x2, y2 = image.width, image.height
-    
-    region = image.crop((x1, y1, x2, y2))
-    gray_region = region.convert('L')
-    stat = ImageStat.Stat(gray_region)
-    avg_brightness = stat.mean[0]
-    return avg_brightness > 128
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -275,7 +258,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста
+    # Проверка цвета текста (улучшенная версия с маской и гистограммой фона)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -283,14 +266,46 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
             for i in range(len(data['text'])):
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    if w > 0 and h > 0:
-                        local_bg_light = get_local_background_type(img_pil, x, y, w, h)
+                    if w > 5 and h > 5:
+                        # ----- Определение локального фона (гистограммный метод) -----
+                        padding = 15
+                        x1 = max(0, x - padding)
+                        y1 = max(0, y - padding)
+                        x2 = min(img_pil.width, x + w + padding)
+                        y2 = min(img_pil.height, y + h + padding)
+                        bg_region = img_pil.crop((x1, y1, x2, y2)).convert('L')
+                        hist = bg_region.histogram()
+                        peak = max(hist[30:225]) if len(hist) > 225 else 128
+                        peak_brightness = hist.index(peak) if peak > 0 else 128
+                        local_bg_light = peak_brightness > 128
+
+                        # ----- Получение чистого цвета текста через маску -----
                         crop = img_pil.crop((x, y, x+w, y+h))
-                        stat = ImageStat.Stat(crop)
-                        avg_color = tuple(map(int, stat.mean[:3]))
-                        if not is_color_allowed(avg_color, local_bg_light):
-                            expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
-                            text_color_issues.append(f"{avg_color} (ожидался {expected})")
+                        crop_gray = crop.convert('L')
+                        _, mask = cv2.threshold(np.array(crop_gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        if local_bg_light:
+                            text_pixels_mask = mask < 128
+                        else:
+                            text_pixels_mask = mask > 128
+
+                        if np.sum(text_pixels_mask) < 5:
+                            text_pixels_mask = ~text_pixels_mask
+
+                        crop_np = np.array(crop)
+                        text_pixels = crop_np[text_pixels_mask]
+
+                        if len(text_pixels) > 10:
+                            median_color = tuple(np.median(text_pixels, axis=0).astype(int))
+                            if not is_color_allowed(median_color, local_bg_light):
+                                expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
+                                text_color_issues.append(f"{median_color} (ожидался {expected})")
+                        else:
+                            stat = ImageStat.Stat(crop)
+                            avg_color = tuple(map(int, stat.mean[:3]))
+                            if not is_color_allowed(avg_color, local_bg_light):
+                                expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
+                                text_color_issues.append(f"{avg_color} (ожидался {expected})")
+
             if text_color_issues:
                 results["text_color_ok"] = False
                 examples = text_color_issues[:3]
@@ -322,7 +337,6 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
         if not results["text_rules_ok"]:
             results["details"].extend([f"⚠️ {issue}" for issue in text_style_issues])
 
-        # Проверка символов
         banner_type = 'xs_s' if text_area_percent < 25 else 'm_l'
         char_ok, char_msg = check_char_count(text, banner_type)
         results["char_count_ok"] = char_ok
@@ -415,7 +429,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен с обновлённой площадью текста 52%...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен с улучшенной проверкой цвета...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
