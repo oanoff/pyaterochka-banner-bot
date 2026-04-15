@@ -50,9 +50,9 @@ TEXTURE_THRESHOLD = 30
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
 # Допустимое отклонение цвета текста
-COLOR_TOLERANCE = 150  # увеличенный допуск
+COLOR_TOLERANCE = 150
 
-# Лимиты символов (подзаголовок увеличен до 55)
+# Лимиты символов
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
 MAX_CHARS_SUBTITLE_M_L = 55
@@ -87,11 +87,9 @@ def color_distance(c1, c2):
 def is_color_allowed(rgb, bg_is_light):
     """Гибкая проверка цвета: для белого - проверка яркости, для тёмного - расстояние."""
     if bg_is_light:
-        # Ожидается тёмный текст (#302E33)
         target = hex_to_rgb(TEXT_COLOR_DARK)
         return color_distance(rgb, target) <= COLOR_TOLERANCE
     else:
-        # Ожидается светлый текст (#FFFFFF) - проверяем, что все компоненты > 170
         return all(c > 170 for c in rgb)
 
 def get_dominant_colors(image, n=3):
@@ -190,6 +188,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
         "logo_ok": True,
         "text_rules_ok": False,
         "char_count_ok": False,
+        "has_text": False,
         "width": 0,
         "height": 0,
         "file_size_mb": 0,
@@ -243,6 +242,16 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["details"].append("ℹ️ Tesseract OCR не установлен на сервере. Проверка текста отключена.")
 
+    # Проверка наличия текста
+    if TESSERACT_AVAILABLE and text:
+        results["has_text"] = True
+    else:
+        results["has_text"] = False
+        if TESSERACT_AVAILABLE:
+            results["details"].append("❌ На баннере не обнаружен текст!")
+        else:
+            results["details"].append("❌ OCR недоступен, текст не может быть проверен!")
+
     # Площадь текстового блока
     text_area_percent = 0
     if TESSERACT_AVAILABLE and text:
@@ -264,7 +273,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (упрощённая и надёжная)
+    # Проверка цвета текста
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -273,7 +282,6 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     if w > 5 and h > 5:
-                        # Определяем локальный фон (по яркости области вокруг)
                         padding = 15
                         x1 = max(0, x - padding)
                         y1 = max(0, y - padding)
@@ -283,9 +291,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
                         bg_mean = np.array(bg_region).mean()
                         local_bg_light = bg_mean > 128
 
-                        # Анализируем центральную область буквы (ядро)
                         crop = img_pil.crop((x, y, x+w, y+h))
-                        # Берём центральные 60% области, чтобы избежать краёв
                         cw, ch = crop.size
                         core = crop.crop((int(cw*0.2), int(ch*0.2), int(cw*0.8), int(ch*0.8)))
                         if core.size[0] > 0 and core.size[1] > 0:
@@ -345,7 +351,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", update: Update =
     # Вердикт
     critical = ["file_size_ok", "format_ok", "dimensions_ok", "aspect_ratio_ok",
                 "text_block_area_ok", "text_color_ok", "background_ok", "logo_ok",
-                "text_rules_ok", "char_count_ok"]
+                "text_rules_ok", "char_count_ok", "has_text"]
     if all(results.get(k, False) for k in critical):
         results["verdict"] = "✅ Баннер соответствует основным требованиям гайдов Пятёрочки!"
     else:
@@ -363,7 +369,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Цвет текста: только {TEXT_COLOR_DARK} или {TEXT_COLOR_LIGHT}\n"
         f"• Фон: без запрещённых цветов и текстур\n"
         f"• Логотип Пятёрочки — запрещён\n"
-        f"• Лимит символов: XS/S до {MAX_CHARS_XS_S}, M/L заголовок до {MAX_CHARS_TITLE_M_L}, подзаголовок до {MAX_CHARS_SUBTITLE_M_L}"
+        f"• Лимит символов: XS/S до {MAX_CHARS_XS_S}, M/L заголовок до {MAX_CHARS_TITLE_M_L}, подзаголовок до {MAX_CHARS_SUBTITLE_M_L}\n"
+        f"• На баннере обязательно должен быть текст"
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -392,6 +399,7 @@ async def send_results(update: Update, results: dict):
         f"📐 *Соотношение:* {results['width']/results['height']:.3f} {status_emoji(results['aspect_ratio_ok'])}",
         f"💾 *Размер файла:* {results['file_size_mb']:.2f} МБ {status_emoji(results['file_size_ok'])}",
         f"🖼 *Формат:* {status_emoji(results['format_ok'])}",
+        f"📄 *Наличие текста:* {status_emoji(results['has_text'])}",
         f"📝 *Площадь текста:* {status_emoji(results['text_block_area_ok'])}",
         f"🎨 *Цвет текста:* {status_emoji(results['text_color_ok'])}",
         f"🌄 *Фон:* {status_emoji(results['background_ok'])}",
@@ -422,7 +430,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен с финальными правками...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (добавлена проверка наличия текста)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
