@@ -10,7 +10,6 @@ import numpy as np
 import pytesseract
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.helpers import escape_markdown as telegram_escape
 from colorthief import ColorThief
 
 # Настройка логирования
@@ -61,8 +60,11 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def escape_markdown(text: str) -> str:
-    """Экранирует спецсимволы MarkdownV2, оставляя корректное форматирование."""
-    return telegram_escape(text, version=2)
+    """Экранирует все зарезервированные символы MarkdownV2."""
+    if not text:
+        return text
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', text)
 
 def rgb_to_hsl(r, g, b):
     r, g, b = r/255.0, g/255.0, b/255.0
@@ -100,7 +102,6 @@ def is_color_allowed(rgb, bg_is_light):
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
-    # Принудительно убираем альфа-канал
     image.convert('RGB').save(temp, format='PNG')
     temp.seek(0)
     color_thief = ColorThief(temp)
@@ -119,7 +120,6 @@ def is_background_bad(image):
             issues.append("белый/пастельный фон")
         if s > MIN_SATURATION_ACID and 40 < l < 80:
             issues.append("кислотный цвет фона")
-    # Проверка пёстрого фона: если более половины палитры насыщенные
     if len(palette) >= 3 and sum(1 for c in palette if rgb_to_hsl(*c)[1] > 40) >= len(palette)/2:
         issues.append("пёстрый фон")
     cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -131,7 +131,6 @@ def is_background_bad(image):
 
 def check_text_styles(text):
     issues = []
-    # Исправленная проверка "ещё"
     if re.search(r'\bеще\b', text, re.IGNORECASE) and not re.search(r'\bещё\b', text, re.IGNORECASE):
         issues.append("возможно, пропущена буква 'ё'")
     if '"' in text or "'" in text or '“' in text or '”' in text:
@@ -172,7 +171,6 @@ def detect_logo_pyaterochka(image):
     template = cv2.imread(LOGO_TEMPLATE_PATH)
     if template is None:
         return False, "не удалось загрузить шаблон логотипа"
-    # Переводим в градации серого для устойчивости
     img_gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
     found = False
@@ -188,9 +186,6 @@ def detect_logo_pyaterochka(image):
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
 def extract_text_color(crop_img, bg_is_light):
-    """
-    Извлекает чистый цвет текста, исключая краевые пиксели.
-    """
     gray = crop_img.convert('L')
     _, mask = cv2.threshold(np.array(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if bg_is_light:
@@ -200,7 +195,6 @@ def extract_text_color(crop_img, bg_is_light):
     if np.sum(text_mask) < 5:
         text_mask = ~text_mask
 
-    # Используем ядро 2x2 для эрозии, чтобы не удалить тонкий текст
     kernel = np.ones((2, 2), np.uint8)
     eroded = cv2.erode(text_mask.astype(np.uint8), kernel, iterations=1)
     final_mask = eroded.astype(bool)
@@ -214,7 +208,7 @@ def extract_text_color(crop_img, bg_is_light):
     median_color = tuple(np.median(pixels, axis=0).astype(int))
     return median_color
 
-# ---------- СИНХРОННЫЙ АНАЛИЗ (выполняется в потоке) ----------
+# ---------- СИНХРОННЫЙ АНАЛИЗ ----------
 def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
     results = {
         "file_size_ok": False,
@@ -241,20 +235,17 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
         if is_compressed:
             results["details"].append("⚠️ Изображение получено как сжатое фото. Размеры и качество могут быть искажены. Рекомендуется отправить файлом (как документ).")
 
-        # Размер файла
         file_size_bytes = len(image_bytes)
         results["file_size_mb"] = file_size_bytes / (1024 * 1024)
         results["file_size_ok"] = results["file_size_mb"] <= MAX_FILE_SIZE_MB
         if not results["file_size_ok"]:
             results["details"].append(f"⚠️ Размер файла {results['file_size_mb']:.2f} МБ > {MAX_FILE_SIZE_MB} МБ")
 
-        # Формат проверяем по расширению (для простоты)
         ext = os.path.splitext(filename)[1].lower()
         results["format_ok"] = ext in {'.jpg', '.jpeg', '.png'}
         if not results["format_ok"]:
             results["details"].append(f"❌ Формат {ext} не поддерживается. Допустимы: .jpg, .jpeg, .png")
 
-        # Открытие изображения
         try:
             img_pil = Image.open(io.BytesIO(image_bytes)).convert('RGB')
             results["width"], results["height"] = img_pil.size
@@ -263,7 +254,6 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
             results["verdict"] = "Невозможно проверить"
             return results
 
-        # Размер и соотношение сторон
         results["dimensions_ok"] = (results["width"] == TARGET_WIDTH and results["height"] == TARGET_HEIGHT)
         if not results["dimensions_ok"]:
             results["details"].append(f"⚠️ Размер {results['width']}x{results['height']} не соответствует {TARGET_WIDTH}x{TARGET_HEIGHT}")
@@ -273,7 +263,6 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
         if not results["aspect_ratio_ok"]:
             results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-        # OCR текста
         text = ""
         if TESSERACT_AVAILABLE:
             try:
@@ -286,7 +275,6 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
         else:
             results["details"].append("ℹ️ Tesseract OCR не установлен на сервере. Проверка текста отключена.")
 
-        # Проверка наличия текста
         if TESSERACT_AVAILABLE and text:
             results["has_text"] = True
         else:
@@ -296,7 +284,6 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
             else:
                 results["details"].append("❌ OCR недоступен, текст не может быть проверен!")
 
-        # Площадь текстового блока
         text_area_percent = 0
         if TESSERACT_AVAILABLE and text:
             try:
@@ -317,7 +304,6 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
         else:
             results["text_block_area_ok"] = True
 
-        # Проверка цвета текста
         if TESSERACT_AVAILABLE and text:
             text_color_issues = []
             try:
@@ -354,19 +340,16 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
         else:
             results["text_color_ok"] = True
 
-        # Проверка фона
         bg_issues = is_background_bad(img_pil)
         results["background_ok"] = len(bg_issues) == 0
         if not results["background_ok"]:
             results["details"].append(f"⚠️ Проблемы с фоном: {', '.join(bg_issues)}")
 
-        # Проверка логотипа
         logo_found, logo_msg = detect_logo_pyaterochka(img_pil)
         results["logo_ok"] = not logo_found
         if logo_found:
             results["details"].append(f"❌ {logo_msg}")
 
-        # Текстовые правила
         if TESSERACT_AVAILABLE and text:
             text_style_issues = check_text_styles(text)
             results["text_rules_ok"] = len(text_style_issues) == 0
@@ -382,10 +365,8 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
             results["text_rules_ok"] = True
             results["char_count_ok"] = True
 
-        # Доп. предупреждение
         results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам. Свяжитесь с [Николаем Кучкаровым](https://t.me/samuraydesign).")
 
-        # Вердикт
         critical = ["file_size_ok", "format_ok", "dimensions_ok", "aspect_ratio_ok",
                     "text_block_area_ok", "text_color_ok", "background_ok", "logo_ok",
                     "text_rules_ok", "char_count_ok", "has_text"]
@@ -401,7 +382,7 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
 
     return results
 
-# ---------- АСИНХРОННАЯ ОБЁРТКА ДЛЯ ТЕЛЕГРАМ ----------
+# ---------- АСИНХРОННАЯ ОБЁРТКА ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, analyze_image_sync, image_bytes, filename, is_compressed)
@@ -444,7 +425,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_results(update, results)
 
 def split_long_message(text: str, max_len: int = 4000) -> list:
-    """Разбивает длинное сообщение на части по строкам, сохраняя целостность Markdown."""
     parts = []
     current = ""
     for line in text.split('\n'):
@@ -463,7 +443,6 @@ def split_long_message(text: str, max_len: int = 4000) -> list:
 async def send_results(update: Update, results: dict):
     status_emoji = lambda ok: "✅" if ok else "❌"
 
-    # Экранируем все динамические данные, включая числа с точками
     width = escape_markdown(str(results['width']))
     height = escape_markdown(str(results['height']))
     ratio = escape_markdown(f"{results['width']/results['height']:.3f}")
