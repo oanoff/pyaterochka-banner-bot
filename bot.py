@@ -43,7 +43,10 @@ MAX_LIGHTNESS_PASTEL = 85
 TEXTURE_THRESHOLD = 30
 
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
-COLOR_TOLERANCE = 150
+
+# Допустимые отклонения цвета
+COLOR_TOLERANCE_DARK = 180   # для тёмного текста
+COLOR_TOLERANCE_LIGHT = 150  # для светлого текста
 
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
@@ -79,9 +82,10 @@ def color_distance(c1, c2):
 def is_color_allowed(rgb, bg_is_light):
     if bg_is_light:
         target = hex_to_rgb(TEXT_COLOR_DARK)
-        return color_distance(rgb, target) <= COLOR_TOLERANCE
+        return color_distance(rgb, target) <= COLOR_TOLERANCE_DARK
     else:
-        return all(c > 170 for c in rgb)
+        white = (255, 255, 255)
+        return color_distance(rgb, white) <= COLOR_TOLERANCE_LIGHT
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -340,7 +344,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
         results["text_rules_ok"] = True
         results["char_count_ok"] = True
 
-    # Доп. предупреждение с кликабельной ссылкой
+    # Доп. предупреждение
     results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам. Свяжитесь с [Николаем Кучкаровым](https://t.me/samuraydesign).")
 
     # Вердикт
@@ -434,7 +438,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (рекомендация отправки файлом, ссылка на дизайнера)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (финальная проверка цвета)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
