@@ -62,7 +62,6 @@ executor = ThreadPoolExecutor(max_workers=4)
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def escape_markdown(text: str) -> str:
     """Экранирует спецсимволы MarkdownV2, оставляя корректное форматирование."""
-    # Используем встроенную функцию telegram (она экранирует для MarkdownV2)
     return telegram_escape(text, version=2)
 
 def rgb_to_hsl(r, g, b):
@@ -249,9 +248,8 @@ def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bo
         if not results["file_size_ok"]:
             results["details"].append(f"⚠️ Размер файла {results['file_size_mb']:.2f} МБ > {MAX_FILE_SIZE_MB} МБ")
 
-        # Формат проверяем по сигнатуре (магическим байтам) или расширению, но здесь просто по расширению для простоты
+        # Формат проверяем по расширению (для простоты)
         ext = os.path.splitext(filename)[1].lower()
-        # Допустим, если расширение корректно
         results["format_ok"] = ext in {'.jpg', '.jpeg', '.png'}
         if not results["format_ok"]:
             results["details"].append(f"❌ Формат {ext} не поддерживается. Допустимы: .jpg, .jpeg, .png")
@@ -464,15 +462,23 @@ def split_long_message(text: str, max_len: int = 4000) -> list:
 
 async def send_results(update: Update, results: dict):
     status_emoji = lambda ok: "✅" if ok else "❌"
+
+    # Экранируем все динамические данные, включая числа с точками
+    width = escape_markdown(str(results['width']))
+    height = escape_markdown(str(results['height']))
+    ratio = escape_markdown(f"{results['width']/results['height']:.3f}")
+    file_size = escape_markdown(f"{results['file_size_mb']:.2f}")
+    verdict = escape_markdown(results['verdict'])
+
     lines = [
-        f"*Результаты проверки баннера:*\n",
+        "*Результаты проверки баннера:*\n",
     ]
     if results.get("is_compressed"):
         lines.append("⚠️ *Внимание:* анализ проводился по сжатому фото. Результаты могут быть неточными.\n")
     lines.extend([
-        f"📏 *Размер:* {results['width']}x{results['height']} {status_emoji(results['dimensions_ok'])}",
-        f"📐 *Соотношение:* {results['width']/results['height']:.3f} {status_emoji(results['aspect_ratio_ok'])}",
-        f"💾 *Размер файла:* {results['file_size_mb']:.2f} МБ {status_emoji(results['file_size_ok'])}",
+        f"📏 *Размер:* {width}x{height} {status_emoji(results['dimensions_ok'])}",
+        f"📐 *Соотношение:* {ratio} {status_emoji(results['aspect_ratio_ok'])}",
+        f"💾 *Размер файла:* {file_size} МБ {status_emoji(results['file_size_ok'])}",
         f"🖼 *Формат:* {status_emoji(results['format_ok'])}",
         f"📄 *Наличие текста:* {status_emoji(results['has_text'])}",
         f"📝 *Площадь текста:* {status_emoji(results['text_block_area_ok'])}",
@@ -481,18 +487,16 @@ async def send_results(update: Update, results: dict):
         f"🏷 *Логотип:* {status_emoji(results['logo_ok'])}",
         f"🔤 *Текстовые правила:* {status_emoji(results['text_rules_ok'])}",
         f"🔢 *Лимит символов:* {status_emoji(results['char_count_ok'])}",
-        f"\n*Вердикт:* {results['verdict']}",
+        f"\n*Вердикт:* {verdict}",
     ])
     if results['details']:
         lines.append("\n📋 *Подробности:*")
-        # Экранируем детали, т.к. в них могут быть спецсимволы
         lines.extend([f"• {escape_markdown(d)}" for d in results['details']])
     if results.get('ocr_text'):
         escaped_text = escape_markdown(results['ocr_text'][:200])
         lines.append(f"\n📝 *Распознанный текст:*\n{escaped_text}...")
 
     full_text = "\n".join(lines)
-    # Разбиваем на части, если превышает лимит
     for part in split_long_message(full_text):
         await update.message.reply_text(part, parse_mode='MarkdownV2')
 
