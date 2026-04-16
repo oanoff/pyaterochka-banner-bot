@@ -52,6 +52,13 @@ MAX_CHARS_TITLE_M_L = 30
 MAX_CHARS_SUBTITLE_M_L = 55
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+def escape_markdown(text):
+    """Экранирует символы, которые могут сломать Markdown парсер Telegram."""
+    if not text:
+        return text
+    escape_chars = r'_*`[]'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
 def rgb_to_hsl(r, g, b):
     r, g, b = r/255.0, g/255.0, b/255.0
     mx = max(r, g, b)
@@ -91,7 +98,6 @@ def is_color_allowed(rgb, bg_is_light):
     return color_distance(rgb, target) <= tolerance
 
 def preprocess_variants(image_pil):
-    """Возвращает список кортежей (название, изображение для OCR)."""
     img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     variants = []
@@ -99,7 +105,7 @@ def preprocess_variants(image_pil):
     # 1. Обычный grayscale
     variants.append(("gray", gray))
 
-    # 2. CLAHE (улучшение контраста)
+    # 2. CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
     variants.append(("clahe", enhanced))
@@ -112,7 +118,6 @@ def preprocess_variants(image_pil):
     return variants
 
 def ocr_with_confidence(img):
-    """Возвращает (текст, data, средний confidence)."""
     custom_config = r'--oem 3 --psm 6 -l rus+eng'
     try:
         data = pytesseract.image_to_data(img, config=custom_config,
@@ -130,7 +135,6 @@ def ocr_with_confidence(img):
         return "", None, 0
 
 def clean_ocr_text(text):
-    """Удаляет строки с малой долей буквенных символов и дубликаты."""
     lines = text.split('\n')
     clean_lines = []
     seen = set()
@@ -138,7 +142,6 @@ def clean_ocr_text(text):
         line = line.strip()
         if not line:
             continue
-        # Подсчёт буквенных символов (кириллица + латиница)
         letters = sum(1 for ch in line if ch.isalpha())
         ratio = letters / len(line) if line else 0
         if ratio >= 0.5 and line not in seen:
@@ -147,7 +150,6 @@ def clean_ocr_text(text):
     return '\n'.join(clean_lines)
 
 def run_ocr_best(image_pil):
-    """Пробует несколько вариантов и выбирает лучший по качеству."""
     if not TESSERACT_AVAILABLE:
         return "", None
 
@@ -159,24 +161,20 @@ def run_ocr_best(image_pil):
     for name, img in variants:
         text, data, avg_conf = ocr_with_confidence(img)
         words = text.split()
-        # Оценка: количество слов * средняя уверенность
         score = len(words) * avg_conf
         if score > best_score:
             best_score = score
             best_text = text
             best_data = data
 
-    # Очистка текста от мусора и дубликатов
     best_text = clean_ocr_text(best_text)
     return best_text, best_data
 
 def extract_text_color_simple(image_rgb, bbox):
-    """Простой и быстрый метод определения цвета текста."""
     x, y, w, h = bbox
     if w < 5 or h < 5:
         return None, None
 
-    # Расширенная область для анализа фона
     pad = 15
     x1 = max(0, x - pad)
     y1 = max(0, y - pad)
@@ -185,17 +183,14 @@ def extract_text_color_simple(image_rgb, bbox):
     crop = image_rgb.crop((x1, y1, x2, y2))
     crop_np = np.array(crop)
 
-    # Средний цвет фона
     avg_color = np.mean(crop_np.reshape(-1, 3), axis=0)
     bg_brightness = 0.299 * avg_color[0] + 0.587 * avg_color[1] + 0.114 * avg_color[2]
     bg_is_light = bg_brightness > 128
 
-    # Вырезаем область текста
     text_crop = image_rgb.crop((x, y, x+w, y+h))
     text_np = np.array(text_crop)
     gray = cv2.cvtColor(text_np, cv2.COLOR_RGB2GRAY)
 
-    # Порог для выделения пикселей текста
     if bg_is_light:
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     else:
@@ -292,12 +287,6 @@ def detect_logo_pyaterochka(image):
             break
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
-# ---------- ФУНКЦИЯ ЭКРАНИРОВАНИЯ ДЛЯ MARKDOWNV2 ----------
-def escape_markdown_v2(text: str) -> str:
-    """Экранирует специальные символы для Telegram MarkdownV2."""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
-
 # ---------- ОСНОВНОЙ АНАЛИЗ ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
     results = {
@@ -356,7 +345,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     if not results["aspect_ratio_ok"]:
         results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-    # OCR текста (выбор лучшего из вариантов)
+    # OCR текста
     text, data = run_ocr_best(img_pil)
     results["ocr_text"] = text
     results["has_text"] = bool(text.strip())
@@ -466,7 +455,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
 
 # ---------- ОБРАБОТЧИКИ TELEGRAM ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
+    msg = (
         "👋 Я — агент проверки баннеров для приложения Пятёрочки.\n\n"
         "📌 *ВАЖНО:* Для точной проверки отправляйте баннер *как документ (файл)*, "
         "а не как фото. Telegram сжимает фото, что искажает размеры и качество.\n\n"
@@ -478,8 +467,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Логотип Пятёрочки — запрещён\n"
         f"• Лимит символов и наличие текста"
     )
-    # Используем MarkdownV2 с экранированием
-    await update.message.reply_text(escape_markdown_v2(welcome_text), parse_mode='MarkdownV2')
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -492,7 +480,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = await analyze_image(image_bytes, filename="image.jpg", is_compressed=True)
         await send_results(update, results)
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при обработке фото: {e}")
+        await update.message.reply_text(f"❌ Ошибка при обработке фото: {escape_markdown(str(e))}", parse_mode='Markdown')
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
@@ -506,25 +494,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = await analyze_image(image_bytes, filename=document.file_name or "image", is_compressed=False)
         await send_results(update, results)
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при анализе файла: {e}")
+        await update.message.reply_text(f"❌ Ошибка при анализе файла: {escape_markdown(str(e))}", parse_mode='Markdown')
         logger.error(f"Document analysis error: {e}")
 
 async def send_results(update: Update, results: dict):
     status_emoji = lambda ok: "✅" if ok else "❌"
-    lines = [
-        "*Результаты проверки баннера:*\n",
-    ]
+    lines = ["*Результаты проверки баннера:*\n"]
     if results.get("is_compressed"):
         lines.append("⚠️ *Внимание:* анализ проводился по сжатому фото. Результаты могут быть неточными.\n")
 
-    # Формируем строки с данными, но не экранируем звёздочки для жирного текста, экранируем только значения
-    def safe_value(val):
-        return escape_markdown_v2(str(val))
+    # Вычисляем соотношение заранее
+    ratio = results['width'] / results['height'] if results['height'] else 0
+    ratio_str = f"{ratio:.3f}"
 
     lines.extend([
-        f"📏 *Размер:* {safe_value(results['width'])}x{safe_value(results['height'])} {status_emoji(results['dimensions_ok'])}",
-        f"📐 *Соотношение:* {safe_value(f\"{results['width']/results['height']:.3f}\")} {status_emoji(results['aspect_ratio_ok'])}",
-        f"💾 *Размер файла:* {safe_value(f\"{results['file_size_mb']:.2f}\")} МБ {status_emoji(results['file_size_ok'])}",
+        f"📏 *Размер:* {results['width']}x{results['height']} {status_emoji(results['dimensions_ok'])}",
+        f"📐 *Соотношение:* {ratio_str} {status_emoji(results['aspect_ratio_ok'])}",
+        f"💾 *Размер файла:* {results['file_size_mb']:.2f} МБ {status_emoji(results['file_size_ok'])}",
         f"🖼 *Формат:* {status_emoji(results['format_ok'])}",
         f"📄 *Наличие текста:* {status_emoji(results['has_text'])}",
         f"📝 *Площадь текста:* {status_emoji(results['text_block_area_ok'])}",
@@ -533,18 +519,20 @@ async def send_results(update: Update, results: dict):
         f"🏷 *Логотип:* {status_emoji(results['logo_ok'])}",
         f"🔤 *Текстовые правила:* {status_emoji(results['text_rules_ok'])}",
         f"🔢 *Лимит символов:* {status_emoji(results['char_count_ok'])}",
-        f"\n*Вердикт:* {safe_value(results['verdict'])}",
+        f"\n*Вердикт:* {results['verdict']}",
     ])
+
     if results['details']:
         lines.append("\n📋 *Подробности:*")
         for detail in results['details']:
-            lines.append(f"• {safe_value(detail)}")
-    if results.get('ocr_text'):
-        lines.append(f"\n📝 *Распознанный текст:*\n{safe_value(results['ocr_text'][:200])}...")
+            lines.append(f"• {escape_markdown(detail)}")
 
-    full_message = "\n".join(lines)
-    # Экранируем только динамические части, но не сам синтаксис Markdown (звёздочки остаются)
-    await update.message.reply_text(full_message, parse_mode='MarkdownV2')
+    if results.get('ocr_text'):
+        ocr_preview = results['ocr_text'][:200]
+        lines.append(f"\n📝 *Распознанный текст:*\n{escape_markdown(ocr_preview)}...")
+
+    message = "\n".join(lines)
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
@@ -560,7 +548,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (гибридный OCR с экранированием)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (исправленная версия)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
