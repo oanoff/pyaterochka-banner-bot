@@ -7,7 +7,6 @@ from PIL import Image, ImageStat
 import cv2
 import numpy as np
 import pytesseract
-from sklearn.cluster import KMeans
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from colorthief import ColorThief
@@ -45,9 +44,9 @@ TEXTURE_THRESHOLD = 30
 
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# Ужесточённые допуски цвета
-COLOR_TOLERANCE = 50
-MAX_SATURATION_FOR_TEXT = 30   # текст не должен быть цветным
+# Допустимые отклонения цвета (щедрые)
+COLOR_TOLERANCE_DARK = 100
+COLOR_TOLERANCE_LIGHT = 150
 
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
@@ -81,16 +80,12 @@ def color_distance(c1, c2):
     return np.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
 
 def is_color_allowed(rgb, bg_is_light):
-    # Проверяем насыщенность
-    _, s, _ = rgb_to_hsl(*rgb)
-    if s > MAX_SATURATION_FOR_TEXT:
-        return False  # цветной текст запрещён
-
     if bg_is_light:
         target = hex_to_rgb(TEXT_COLOR_DARK)
+        return color_distance(rgb, target) <= COLOR_TOLERANCE_DARK
     else:
         target = hex_to_rgb(TEXT_COLOR_LIGHT)
-    return color_distance(rgb, target) <= COLOR_TOLERANCE
+        return color_distance(rgb, target) <= COLOR_TOLERANCE_LIGHT
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -175,76 +170,22 @@ def detect_logo_pyaterochka(image):
             break
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
-def extract_text_color_kmeans(image_rgb, bbox):
+def extract_text_color(crop_img):
     """
-    Точное определение цвета текста с помощью KMeans кластеризации.
-    Возвращает (средний цвет текста, флаг светлого фона) или (None, None).
+    Простой и надёжный метод: средний цвет центральной области (60% ширины и высоты).
     """
-    x, y, w, h = bbox
-    if w < 5 or h < 5:
-        return None, None
-
-    # Расширенная область для захвата текста и фона вокруг
-    pad = 10
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(image_rgb.width, x + w + pad)
-    y2 = min(image_rgb.height, y + h + pad)
-    crop = image_rgb.crop((x1, y1, x2, y2))
-    crop_np = np.array(crop)  # (H, W, 3) RGB
-
-    # Преобразуем в двумерный массив пикселей
-    pixels = crop_np.reshape(-1, 3).astype(np.float32)
-
-    if len(pixels) < 10:
-        return None, None
-
-    # Кластеризация на 2 кластера (текст и фон)
-    kmeans = KMeans(n_clusters=2, random_state=0, n_init=10)
-    labels = kmeans.fit_predict(pixels)
-    centers = kmeans.cluster_centers_.astype(int)
-
-    # Определим, какой кластер — фон, по близости к среднему цвету расширенной области фона
-    # Возьмём ещё более широкую область вокруг, исключая внутренний текст
-    bg_pad = 25
-    bg_x1 = max(0, x - bg_pad)
-    bg_y1 = max(0, y - bg_pad)
-    bg_x2 = min(image_rgb.width, x + w + bg_pad)
-    bg_y2 = min(image_rgb.height, y + h + bg_pad)
-    bg_crop = image_rgb.crop((bg_x1, bg_y1, bg_x2, bg_y2))
-    bg_np = np.array(bg_crop)
-
-    # Маска, исключающая область текста
-    mask = np.ones(bg_np.shape[:2], dtype=bool)
-    rel_x1 = max(0, x - bg_x1)
-    rel_y1 = max(0, y - bg_y1)
-    rel_x2 = min(bg_np.shape[1], rel_x1 + w)
-    rel_y2 = min(bg_np.shape[0], rel_y1 + h)
-    if rel_x2 > rel_x1 and rel_y2 > rel_y1:
-        mask[rel_y1:rel_y2, rel_x1:rel_x2] = False
-
-    if np.sum(mask) > 50:
-        bg_pixels = bg_np[mask]
+    w, h = crop_img.size
+    # Центральные 60%
+    left = int(w * 0.2)
+    top = int(h * 0.2)
+    right = int(w * 0.8)
+    bottom = int(h * 0.8)
+    if right <= left or bottom <= top:
+        core = crop_img
     else:
-        bg_pixels = bg_np.reshape(-1, 3)
-
-    avg_bg_color = np.mean(bg_pixels, axis=0)
-    bg_brightness = 0.299 * avg_bg_color[0] + 0.587 * avg_bg_color[1] + 0.114 * avg_bg_color[2]
-    bg_is_light = bg_brightness > 128
-
-    # Определяем, какой кластер ближе к среднему фону
-    dist0 = np.linalg.norm(centers[0] - avg_bg_color)
-    dist1 = np.linalg.norm(centers[1] - avg_bg_color)
-    if dist0 < dist1:
-        bg_cluster = 0
-        text_cluster = 1
-    else:
-        bg_cluster = 1
-        text_cluster = 0
-
-    text_color = centers[text_cluster]
-
-    return tuple(text_color), bg_is_light
+        core = crop_img.crop((left, top, right, bottom))
+    stat = ImageStat.Stat(core)
+    return tuple(map(int, stat.mean[:3]))
 
 # ---------- ОСНОВНОЙ АНАЛИЗ ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
@@ -348,7 +289,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (KMeans метод)
+    # Проверка цвета текста (упрощённый метод через ядро)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -357,12 +298,21 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     if w > 5 and h > 5:
-                        bbox = (x, y, w, h)
-                        text_color, bg_is_light = extract_text_color_kmeans(img_pil, bbox)
-                        if text_color is None:
-                            continue
-                        if not is_color_allowed(text_color, bg_is_light):
-                            expected = TEXT_COLOR_DARK if bg_is_light else TEXT_COLOR_LIGHT
+                        # Определяем локальный фон
+                        padding = 15
+                        x1 = max(0, x - padding)
+                        y1 = max(0, y - padding)
+                        x2 = min(img_pil.width, x + w + padding)
+                        y2 = min(img_pil.height, y + h + padding)
+                        bg_region = img_pil.crop((x1, y1, x2, y2)).convert('L')
+                        bg_mean = np.array(bg_region).mean()
+                        local_bg_light = bg_mean > 128
+
+                        crop = img_pil.crop((x, y, x+w, y+h))
+                        text_color = extract_text_color(crop)
+
+                        if not is_color_allowed(text_color, local_bg_light):
+                            expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
                             text_color_issues.append(f"{text_color} (ожидался {expected})")
 
             if text_color_issues:
@@ -499,7 +449,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (KMeans анализ цвета)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (упрощённый анализ цвета)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
