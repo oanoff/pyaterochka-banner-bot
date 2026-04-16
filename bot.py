@@ -10,6 +10,7 @@ import pytesseract
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from colorthief import ColorThief
+from sklearn.cluster import KMeans
 
 # Настройка логирования
 logging.basicConfig(
@@ -45,8 +46,8 @@ TEXTURE_THRESHOLD = 30
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
 # Допустимые отклонения цвета
-COLOR_TOLERANCE_DARK = 180   # для тёмного текста
-COLOR_TOLERANCE_LIGHT = 150  # для светлого текста
+COLOR_TOLERANCE_DARK = 180
+COLOR_TOLERANCE_LIGHT = 150
 
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
@@ -170,6 +171,19 @@ def detect_logo_pyaterochka(image):
             break
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
+def get_text_color_kmeans(crop_rgb):
+    """Определяет основной цвет текста с помощью KMeans (2 кластера)."""
+    pixels = crop_rgb.reshape(-1, 3).astype(np.float32)
+    if len(pixels) < 10:
+        return None
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(pixels)
+    centers = kmeans.cluster_centers_.astype(int)
+    # Определяем, какой кластер - текст: обычно это менее частый цвет (текст занимает меньше пикселей)
+    unique, counts = np.unique(labels, return_counts=True)
+    text_label = unique[np.argmin(counts)]  # меньший по площади - текст
+    return tuple(centers[text_label])
+
 # ---------- ОСНОВНОЙ АНАЛИЗ ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
     results = {
@@ -272,7 +286,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста
+    # Проверка цвета текста (с KMeans)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -291,18 +305,13 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                         local_bg_light = bg_mean > 128
 
                         crop = img_pil.crop((x, y, x+w, y+h))
-                        cw, ch = crop.size
-                        core = crop.crop((int(cw*0.2), int(ch*0.2), int(cw*0.8), int(ch*0.8)))
-                        if core.size[0] > 0 and core.size[1] > 0:
-                            stat = ImageStat.Stat(core)
-                            avg_color = tuple(map(int, stat.mean[:3]))
-                        else:
-                            stat = ImageStat.Stat(crop)
-                            avg_color = tuple(map(int, stat.mean[:3]))
-
-                        if not is_color_allowed(avg_color, local_bg_light):
+                        crop_np = np.array(crop)
+                        text_color = get_text_color_kmeans(crop_np)
+                        if text_color is None:
+                            continue
+                        if not is_color_allowed(text_color, local_bg_light):
                             expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
-                            text_color_issues.append(f"{avg_color} (ожидался {expected})")
+                            text_color_issues.append(f"{text_color} (ожидался {expected})")
 
             if text_color_issues:
                 results["text_color_ok"] = False
@@ -438,7 +447,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (финальная проверка цвета)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (KMeans для цвета текста)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
