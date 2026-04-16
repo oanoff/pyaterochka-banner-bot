@@ -2,11 +2,10 @@ import os
 import io
 import re
 import logging
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageStat
 import cv2
 import numpy as np
 import pytesseract
-from sklearn.cluster import KMeans
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from colorthief import ColorThief
@@ -91,177 +90,88 @@ def is_color_allowed(rgb, bg_is_light):
         tolerance = COLOR_TOLERANCE_LIGHT
     return color_distance(rgb, target) <= tolerance
 
-def enhance_image(image_pil):
-    """Увеличивает контраст и резкость для улучшения OCR."""
-    enhancer = ImageEnhance.Contrast(image_pil)
-    img = enhancer.enhance(2.0)  # Увеличиваем контраст в 2 раза
-    img = img.filter(ImageFilter.SHARPEN)
-    return img
-
-def preprocess_variants(image_pil):
-    """Возвращает список вариантов изображений для OCR."""
-    variants = []
-
-    # 1. Оригинал в градациях серого
-    gray = image_pil.convert('L')
-    variants.append(("gray", np.array(gray)))
-
-    # 2. Увеличенный контраст + серый
-    enhanced = enhance_image(image_pil).convert('L')
-    variants.append(("enhanced", np.array(enhanced)))
-
-    # 3. CLAHE на сером
+def preprocess_for_ocr(image_pil):
+    """Улучшенная предобработка для OCR."""
     img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-    gray_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+
+    # Повышение контраста
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    cl1 = clahe.apply(gray_cv)
-    variants.append(("clahe", cl1))
+    enhanced = clahe.apply(gray)
 
-    return variants
+    # Адаптивная бинаризация
+    binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    return binary
 
-def clean_ocr_text(text):
-    """Удаляет мусорные символы, оставляя только читаемый текст."""
-    # Удаляем строки, состоящие в основном из не-букв
-    lines = text.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        # Считаем долю буквенных символов (кириллица и латиница)
-        letters = re.findall(r'[А-Яа-яA-Za-z]', line)
-        if len(letters) > len(line) * 0.3:  # хотя бы 30% букв
-            cleaned_lines.append(line.strip())
-    return '\n'.join(cleaned_lines)
-
-def ocr_with_confidence(img_array):
-    """Возвращает (текст, data, средний confidence)."""
-    custom_config = r'--oem 3 --psm 6 -l rus+eng'
-    try:
-        data = pytesseract.image_to_data(img_array, config=custom_config,
-                                         output_type=pytesseract.Output.DICT)
-        text = pytesseract.image_to_string(img_array, config=custom_config).strip()
-        # Очищаем текст от мусора
-        text = clean_ocr_text(text)
-        # Считаем средний confidence для слов с conf > 30
-        confs = []
-        for i in range(len(data['text'])):
-            word = data['text'][i].strip()
-            conf = int(data['conf'][i])
-            if word and conf > 30:
-                confs.append(conf)
-        avg_conf = sum(confs) / len(confs) if confs else 0
-        return text, data, avg_conf
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        return "", None, 0
-
-def run_ocr_best(image_pil):
-    """Пробует несколько вариантов OCR и возвращает лучший."""
+def run_ocr(image_pil):
+    """Запуск OCR с оптимизированными настройками."""
     if not TESSERACT_AVAILABLE:
         return "", None
+    processed = preprocess_for_ocr(image_pil)
+    custom_config = r'--oem 3 --psm 6 -l rus+eng'
+    try:
+        text = pytesseract.image_to_string(processed, config=custom_config).strip()
+        data = pytesseract.image_to_data(processed, config=custom_config,
+                                         output_type=pytesseract.Output.DICT)
+        # Удаление дубликатов строк и мусора
+        lines = text.split('\n')
+        clean_lines = []
+        seen = set()
+        for line in lines:
+            clean = line.strip()
+            # Оставляем строки, где есть хотя бы одна буква
+            if clean and re.search(r'[А-Яа-яA-Za-z]', clean) and clean not in seen:
+                seen.add(clean)
+                clean_lines.append(clean)
+        text = '\n'.join(clean_lines)
+        return text, data
+    except Exception as e:
+        logger.error(f"OCR error: {e}")
+        return "", None
 
-    variants = preprocess_variants(image_pil)
-    best_text = ""
-    best_data = None
-    best_score = -1
-
-    for name, img_array in variants:
-        text, data, avg_conf = ocr_with_confidence(img_array)
-        # Оценка: количество слов * средняя уверенность (грубо)
-        words = re.findall(r'\w+', text)
-        score = len(words) * avg_conf
-        if score > best_score:
-            best_score = score
-            best_text = text
-            best_data = data
-
-    # Дополнительная фильтрация дубликатов строк
-    lines = best_text.split('\n')
-    unique_lines = []
-    seen = set()
-    for line in lines:
-        clean = line.strip()
-        if clean and clean not in seen:
-            seen.add(clean)
-            unique_lines.append(clean)
-    return '\n'.join(unique_lines), best_data
-
-def get_background_brightness_around(image_rgb, bbox, pad=30):
-    x, y, w, h = bbox
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(image_rgb.width, x + w + pad)
-    y2 = min(image_rgb.height, y + h + pad)
-    crop = image_rgb.crop((x1, y1, x2, y2))
-    crop_np = np.array(crop)
-    mask = np.ones(crop_np.shape[:2], dtype=bool)
-    rel_x1 = max(0, x - x1)
-    rel_y1 = max(0, y - y1)
-    rel_x2 = min(crop_np.shape[1], rel_x1 + w)
-    rel_y2 = min(crop_np.shape[0], rel_y1 + h)
-    if rel_x2 > rel_x1 and rel_y2 > rel_y1:
-        mask[rel_y1:rel_y2, rel_x1:rel_x2] = False
-    bg_pixels = crop_np[mask] if np.sum(mask) > 0 else crop_np.reshape(-1, 3)
-    avg_bg = np.mean(bg_pixels, axis=0)
-    brightness = 0.299 * avg_bg[0] + 0.587 * avg_bg[1] + 0.114 * avg_bg[2]
-    return brightness > 128, avg_bg
-
-def extract_text_color_kmeans_robust(image_rgb, bbox):
+def extract_text_color_simple(image_rgb, bbox):
+    """Простой и быстрый метод определения цвета текста."""
     x, y, w, h = bbox
     if w < 5 or h < 5:
         return None, None
-    pad = 10
+
+    # Расширяем область для анализа фона
+    pad = 15
     x1 = max(0, x - pad)
     y1 = max(0, y - pad)
     x2 = min(image_rgb.width, x + w + pad)
     y2 = min(image_rgb.height, y + h + pad)
     crop = image_rgb.crop((x1, y1, x2, y2))
     crop_np = np.array(crop)
-    pixels = crop_np.reshape(-1, 3).astype(np.float32)
-    if len(pixels) < 10:
-        return None, None
 
-    bg_is_light, _ = get_background_brightness_around(image_rgb, bbox)
+    # Средний цвет области (грубый фон)
+    avg_color = np.mean(crop_np.reshape(-1, 3), axis=0)
+    bg_brightness = 0.299 * avg_color[0] + 0.587 * avg_color[1] + 0.114 * avg_color[2]
+    bg_is_light = bg_brightness > 128
 
-    # KMeans с 2 или 3 кластерами
-    best_centers = None
-    best_labels = None
-    for n_clusters in [2, 3]:
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
-        labels = kmeans.fit_predict(pixels)
-        centers = kmeans.cluster_centers_.astype(int)
-        _, avg_bg = get_background_brightness_around(image_rgb, bbox, pad=5)
-        dists = [np.linalg.norm(center - avg_bg) for center in centers]
-        bg_cluster = np.argmin(dists)
-        brightnesses = [0.299*c[0] + 0.587*c[1] + 0.114*c[2] for c in centers]
-        if bg_is_light:
-            text_cluster = np.argmin(brightnesses)
-        else:
-            text_cluster = np.argmax(brightnesses)
-        if text_cluster == bg_cluster:
-            continue
-        best_centers = centers
-        best_labels = labels
-        break
+    # Вырезаем точную область текста
+    text_crop = image_rgb.crop((x, y, x+w, y+h))
+    text_np = np.array(text_crop)
+    gray = cv2.cvtColor(text_np, cv2.COLOR_RGB2GRAY)
 
-    if best_centers is None:
-        return None, None
-
-    _, avg_bg = get_background_brightness_around(image_rgb, bbox, pad=5)
-    dists = [np.linalg.norm(center - avg_bg) for center in best_centers]
-    bg_cluster = np.argmin(dists)
-    brightnesses = [0.299*c[0] + 0.587*c[1] + 0.114*c[2] for c in best_centers]
+    # Порог для отделения текста от фона
     if bg_is_light:
-        text_cluster = np.argmin(brightnesses)
+        # Тёмный текст
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     else:
-        text_cluster = np.argmax(brightnesses)
-    if text_cluster == bg_cluster:
-        sorted_idx = np.argsort(brightnesses)
-        if bg_is_light:
-            text_cluster = sorted_idx[0] if sorted_idx[0] != bg_cluster else sorted_idx[1]
-        else:
-            text_cluster = sorted_idx[-1] if sorted_idx[-1] != bg_cluster else sorted_idx[-2]
+        # Светлый текст
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    text_color = best_centers[text_cluster]
-    return tuple(text_color), bg_is_light
+    # Пиксели текста
+    text_pixels = text_np[thresh == 255]
+    if len(text_pixels) == 0:
+        # Если не выделились, берём средний цвет всей области текста
+        stat = ImageStat.Stat(text_crop)
+        return tuple(map(int, stat.mean[:3])), bg_is_light
+
+    avg_text_color = np.mean(text_pixels, axis=0)
+    return tuple(map(int, avg_text_color)), bg_is_light
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -404,8 +314,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     if not results["aspect_ratio_ok"]:
         results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-    # OCR текста (выбор лучшего варианта)
-    text, data = run_ocr_best(img_pil)
+    # OCR текста
+    text, data = run_ocr(img_pil)
     results["ocr_text"] = text
     results["has_text"] = bool(text.strip())
     if not results["has_text"]:
@@ -434,7 +344,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста
+    # Проверка цвета текста (простой метод)
     if data is not None and results["has_text"]:
         text_color_issues = []
         try:
@@ -443,7 +353,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     if w > 5 and h > 5:
                         bbox = (x, y, w, h)
-                        text_color, bg_is_light = extract_text_color_kmeans_robust(img_pil, bbox)
+                        text_color, bg_is_light = extract_text_color_simple(img_pil, bbox)
                         if text_color is None:
                             continue
                         if not is_color_allowed(text_color, bg_is_light):
@@ -463,16 +373,24 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
         results["text_color_ok"] = True
 
     # Проверка фона
-    bg_issues = is_background_bad(img_pil)
-    results["background_ok"] = len(bg_issues) == 0
-    if not results["background_ok"]:
-        results["details"].append(f"⚠️ Проблемы с фоном: {', '.join(bg_issues)}")
+    try:
+        bg_issues = is_background_bad(img_pil)
+        results["background_ok"] = len(bg_issues) == 0
+        if not results["background_ok"]:
+            results["details"].append(f"⚠️ Проблемы с фоном: {', '.join(bg_issues)}")
+    except Exception as e:
+        results["details"].append(f"⚠️ Ошибка проверки фона: {e}")
+        results["background_ok"] = True
 
     # Проверка логотипа
-    logo_found, logo_msg = detect_logo_pyaterochka(img_pil)
-    results["logo_ok"] = not logo_found
-    if logo_found:
-        results["details"].append(f"❌ {logo_msg}")
+    try:
+        logo_found, logo_msg = detect_logo_pyaterochka(img_pil)
+        results["logo_ok"] = not logo_found
+        if logo_found:
+            results["details"].append(f"❌ {logo_msg}")
+    except Exception as e:
+        results["details"].append(f"⚠️ Ошибка проверки логотипа: {e}")
+        results["logo_ok"] = True
 
     # Текстовые правила
     if results["has_text"]:
@@ -525,10 +443,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚠️ Вы отправили сжатое фото. Размеры могли измениться.\n"
         "🔍 Всё равно анализирую, но для точной проверки отправьте файл (как документ)."
     )
-    photo_file = await update.message.photo[-1].get_file()
-    image_bytes = await photo_file.download_as_bytearray()
-    results = await analyze_image(image_bytes, filename="image.jpg", is_compressed=True)
-    await send_results(update, results)
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        image_bytes = await photo_file.download_as_bytearray()
+        results = await analyze_image(image_bytes, filename="image.jpg", is_compressed=True)
+        await send_results(update, results)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при обработке фото: {e}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
@@ -536,10 +457,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пожалуйста, отправьте изображение.")
         return
     await update.message.reply_text("🔍 Анализирую оригинальный файл...")
-    file = await document.get_file()
-    image_bytes = await file.download_as_bytearray()
-    results = await analyze_image(image_bytes, filename=document.file_name or "image", is_compressed=False)
-    await send_results(update, results)
+    try:
+        file = await document.get_file()
+        image_bytes = await file.download_as_bytearray()
+        results = await analyze_image(image_bytes, filename=document.file_name or "image", is_compressed=False)
+        await send_results(update, results)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при анализе файла: {e}")
+        logger.error(f"Document analysis error: {e}")
 
 async def send_results(update: Update, results: dict):
     status_emoji = lambda ok: "✅" if ok else "❌"
@@ -584,7 +509,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (улучшенный OCR с фильтрацией)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (стабильная версия)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
