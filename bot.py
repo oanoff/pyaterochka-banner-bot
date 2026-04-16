@@ -2,7 +2,7 @@ import os
 import io
 import re
 import logging
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import cv2
 import numpy as np
 import pytesseract
@@ -91,34 +91,62 @@ def is_color_allowed(rgb, bg_is_light):
         tolerance = COLOR_TOLERANCE_LIGHT
     return color_distance(rgb, target) <= tolerance
 
+def enhance_image(image_pil):
+    """Увеличивает контраст и резкость для улучшения OCR."""
+    enhancer = ImageEnhance.Contrast(image_pil)
+    img = enhancer.enhance(2.0)  # Увеличиваем контраст в 2 раза
+    img = img.filter(ImageFilter.SHARPEN)
+    return img
+
 def preprocess_variants(image_pil):
-    """Возвращает список кортежей (название, изображение для OCR)."""
-    img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    """Возвращает список вариантов изображений для OCR."""
     variants = []
 
-    # 1. Оригинальный градации серого
-    variants.append(("gray", gray))
+    # 1. Оригинал в градациях серого
+    gray = image_pil.convert('L')
+    variants.append(("gray", np.array(gray)))
 
-    # 2. CLAHE + адаптивный порог
+    # 2. Увеличенный контраст + серый
+    enhanced = enhance_image(image_pil).convert('L')
+    variants.append(("enhanced", np.array(enhanced)))
+
+    # 3. CLAHE на сером
+    img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+    gray_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(gray)
-    binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 11, 2)
-    variants.append(("binary", binary))
+    cl1 = clahe.apply(gray_cv)
+    variants.append(("clahe", cl1))
 
     return variants
 
-def ocr_with_confidence(img):
+def clean_ocr_text(text):
+    """Удаляет мусорные символы, оставляя только читаемый текст."""
+    # Удаляем строки, состоящие в основном из не-букв
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # Считаем долю буквенных символов (кириллица и латиница)
+        letters = re.findall(r'[А-Яа-яA-Za-z]', line)
+        if len(letters) > len(line) * 0.3:  # хотя бы 30% букв
+            cleaned_lines.append(line.strip())
+    return '\n'.join(cleaned_lines)
+
+def ocr_with_confidence(img_array):
     """Возвращает (текст, data, средний confidence)."""
     custom_config = r'--oem 3 --psm 6 -l rus+eng'
     try:
-        data = pytesseract.image_to_data(img, config=custom_config,
+        data = pytesseract.image_to_data(img_array, config=custom_config,
                                          output_type=pytesseract.Output.DICT)
-        text = pytesseract.image_to_string(img, config=custom_config).strip()
+        text = pytesseract.image_to_string(img_array, config=custom_config).strip()
+        # Очищаем текст от мусора
+        text = clean_ocr_text(text)
         # Считаем средний confidence для слов с conf > 30
-        confs = [int(data['conf'][i]) for i in range(len(data['text'])) 
-                 if data['text'][i].strip() and int(data['conf'][i]) > 30]
+        confs = []
+        for i in range(len(data['text'])):
+            word = data['text'][i].strip()
+            conf = int(data['conf'][i])
+            if word and conf > 30:
+                confs.append(conf)
         avg_conf = sum(confs) / len(confs) if confs else 0
         return text, data, avg_conf
     except Exception as e:
@@ -135,10 +163,10 @@ def run_ocr_best(image_pil):
     best_data = None
     best_score = -1
 
-    for name, img in variants:
-        text, data, avg_conf = ocr_with_confidence(img)
+    for name, img_array in variants:
+        text, data, avg_conf = ocr_with_confidence(img_array)
         # Оценка: количество слов * средняя уверенность (грубо)
-        words = text.split()
+        words = re.findall(r'\w+', text)
         score = len(words) * avg_conf
         if score > best_score:
             best_score = score
@@ -556,7 +584,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (гибкий OCR)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (улучшенный OCR с фильтрацией)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
