@@ -44,9 +44,9 @@ TEXTURE_THRESHOLD = 30
 
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# Допустимые отклонения цвета (евклидово расстояние)
+# Допустимые отклонения цвета (увеличен допуск для светлого)
 COLOR_TOLERANCE_DARK = 80
-COLOR_TOLERANCE_LIGHT = 100
+COLOR_TOLERANCE_LIGHT = 120
 
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
@@ -172,20 +172,20 @@ def detect_logo_pyaterochka(image):
 
 def extract_text_color(crop_img, bg_is_light):
     """
-    Извлекает чистый цвет текста, исключая краевые пиксели.
+    Извлекает чистый цвет текста, исключая краевые пиксели (1-2 px).
     """
     gray = crop_img.convert('L')
     # Бинаризация Отсу
     _, mask = cv2.threshold(np.array(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if bg_is_light:
-        text_mask = mask < 128   # текст темнее фона
+        text_mask = mask < 128
     else:
-        text_mask = mask > 128   # текст светлее фона
+        text_mask = mask > 128
     if np.sum(text_mask) < 5:
         text_mask = ~text_mask
 
-    # Эрозия для удаления 2-3 краевых пикселей (ядро 3x3)
-    kernel = np.ones((3, 3), np.uint8)
+    # Эрозия ядром 2x2 (убирает 1-2 пикселя)
+    kernel = np.ones((2, 2), np.uint8)
     eroded = cv2.erode(text_mask.astype(np.uint8), kernel, iterations=1)
     final_mask = eroded.astype(bool)
 
@@ -193,8 +193,10 @@ def extract_text_color(crop_img, bg_is_light):
     if np.sum(final_mask) > 10:
         pixels = crop_np[final_mask]
     else:
-        # fallback на исходную маску
-        pixels = crop_np[text_mask]
+        # Fallback: центральная область (60% ширины и высоты)
+        w, h = crop_img.size
+        core = crop_img.crop((int(w*0.2), int(h*0.2), int(w*0.8), int(h*0.8)))
+        pixels = np.array(core).reshape(-1, 3)
 
     # Медиана по каждому каналу
     median_color = tuple(np.median(pixels, axis=0).astype(int))
@@ -302,7 +304,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (новая логика с эрозией)
+    # Проверка цвета текста (эрозия 2x2 + увеличенный допуск)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -311,7 +313,6 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     if w > 5 and h > 5:
-                        # Определяем локальный фон
                         padding = 15
                         x1 = max(0, x - padding)
                         y1 = max(0, y - padding)
@@ -462,7 +463,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (эрозия маски текста)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (эрозия 2x2, допуск 120)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
