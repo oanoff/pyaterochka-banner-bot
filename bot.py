@@ -3,12 +3,14 @@ import io
 import re
 import asyncio
 import logging
-from PIL import Image, ImageStat
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
 import cv2
 import numpy as np
 import pytesseract
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.helpers import escape_markdown as telegram_escape
 from colorthief import ColorThief
 
 # Настройка логирования
@@ -32,7 +34,7 @@ TARGET_HEIGHT = 570
 ASPECT_RATIO = TARGET_WIDTH / TARGET_HEIGHT
 SIZE_TOLERANCE = 0.0
 MAX_FILE_SIZE_MB = 5
-ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
+ALLOWED_MIME_TYPES = {'image/jpeg', 'image/png', 'image/jpg'}
 
 TEXT_COLOR_DARK = "#302E33"
 TEXT_COLOR_LIGHT = "#FFFFFF"
@@ -42,7 +44,9 @@ MIN_SATURATION_ACID = 50
 MAX_LIGHTNESS_PASTEL = 85
 TEXTURE_THRESHOLD = 30
 
-LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
+# Абсолютный путь к шаблону логотипа
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "pyaterochka_logo.png")
 
 # Допустимые отклонения цвета (евклидово расстояние)
 COLOR_TOLERANCE_DARK = 80
@@ -52,7 +56,15 @@ MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
 MAX_CHARS_SUBTITLE_M_L = 55
 
+# Пул потоков для CPU-задач
+executor = ThreadPoolExecutor(max_workers=4)
+
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+def escape_markdown(text: str) -> str:
+    """Экранирует спецсимволы MarkdownV2, оставляя корректное форматирование."""
+    # Используем встроенную функцию telegram (она экранирует для MarkdownV2)
+    return telegram_escape(text, version=2)
+
 def rgb_to_hsl(r, g, b):
     r, g, b = r/255.0, g/255.0, b/255.0
     mx = max(r, g, b)
@@ -89,7 +101,8 @@ def is_color_allowed(rgb, bg_is_light):
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
-    image.save(temp, format='PNG')
+    # Принудительно убираем альфа-канал
+    image.convert('RGB').save(temp, format='PNG')
     temp.seek(0)
     color_thief = ColorThief(temp)
     palette = color_thief.get_palette(color_count=n)
@@ -105,10 +118,11 @@ def is_background_bad(image):
             issues.append("чёрный цвет фона")
         if l > 90 or (l > MAX_LIGHTNESS_PASTEL and s < 20):
             issues.append("белый/пастельный фон")
-        if s > MIN_SATURATION_ACID and l > 40 and l < 80:
+        if s > MIN_SATURATION_ACID and 40 < l < 80:
             issues.append("кислотный цвет фона")
-        if len(palette) >= 3 and all(rgb_to_hsl(*c)[1] > 40 for c in palette[:3]):
-            issues.append("пёстрый фон")
+    # Проверка пёстрого фона: если более половины палитры насыщенные
+    if len(palette) >= 3 and sum(1 for c in palette if rgb_to_hsl(*c)[1] > 40) >= len(palette)/2:
+        issues.append("пёстрый фон")
     cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
@@ -118,7 +132,8 @@ def is_background_bad(image):
 
 def check_text_styles(text):
     issues = []
-    if re.search(r'\bещ[её]\b', text) and 'ё' not in text:
+    # Исправленная проверка "ещё"
+    if re.search(r'\bеще\b', text, re.IGNORECASE) and not re.search(r'\bещё\b', text, re.IGNORECASE):
         issues.append("возможно, пропущена буква 'ё'")
     if '"' in text or "'" in text or '“' in text or '”' in text:
         issues.append("используйте кавычки-ёлочки «»")
@@ -158,12 +173,15 @@ def detect_logo_pyaterochka(image):
     template = cv2.imread(LOGO_TEMPLATE_PATH)
     if template is None:
         return False, "не удалось загрузить шаблон логотипа"
+    # Переводим в градации серого для устойчивости
+    img_gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
     found = False
     for scale in np.linspace(0.5, 1.5, 10):
-        resized = cv2.resize(template, (0,0), fx=scale, fy=scale)
-        if resized.shape[0] > img_cv.shape[0] or resized.shape[1] > img_cv.shape[1]:
+        resized = cv2.resize(template_gray, (0,0), fx=scale, fy=scale)
+        if resized.shape[0] > img_gray.shape[0] or resized.shape[1] > img_gray.shape[1]:
             continue
-        res = cv2.matchTemplate(img_cv, resized, cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(img_gray, resized, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
         if max_val > 0.7:
             found = True
@@ -175,17 +193,16 @@ def extract_text_color(crop_img, bg_is_light):
     Извлекает чистый цвет текста, исключая краевые пиксели.
     """
     gray = crop_img.convert('L')
-    # Бинаризация Отсу
     _, mask = cv2.threshold(np.array(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if bg_is_light:
-        text_mask = mask < 128   # текст темнее фона
+        text_mask = mask < 128
     else:
-        text_mask = mask > 128   # текст светлее фона
+        text_mask = mask > 128
     if np.sum(text_mask) < 5:
         text_mask = ~text_mask
 
-    # Эрозия для удаления 2-3 краевых пикселей (ядро 3x3)
-    kernel = np.ones((3, 3), np.uint8)
+    # Используем ядро 2x2 для эрозии, чтобы не удалить тонкий текст
+    kernel = np.ones((2, 2), np.uint8)
     eroded = cv2.erode(text_mask.astype(np.uint8), kernel, iterations=1)
     final_mask = eroded.astype(bool)
 
@@ -193,15 +210,13 @@ def extract_text_color(crop_img, bg_is_light):
     if np.sum(final_mask) > 10:
         pixels = crop_np[final_mask]
     else:
-        # fallback на исходную маску
         pixels = crop_np[text_mask]
 
-    # Медиана по каждому каналу
     median_color = tuple(np.median(pixels, axis=0).astype(int))
     return median_color
 
-# ---------- ОСНОВНОЙ АНАЛИЗ ----------
-async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
+# ---------- СИНХРОННЫЙ АНАЛИЗ (выполняется в потоке) ----------
+def analyze_image_sync(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
     results = {
         "file_size_ok": False,
         "format_ok": False,
@@ -223,164 +238,175 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
         "is_compressed": is_compressed
     }
 
-    if is_compressed:
-        results["details"].append("⚠️ Изображение получено как сжатое фото. Размеры и качество могут быть искажены. Рекомендуется отправить файлом (как документ).")
-
-    # Размер файла
-    file_size_bytes = len(image_bytes)
-    results["file_size_mb"] = file_size_bytes / (1024 * 1024)
-    results["file_size_ok"] = results["file_size_mb"] <= MAX_FILE_SIZE_MB
-    if not results["file_size_ok"]:
-        results["details"].append(f"⚠️ Размер файла {results['file_size_mb']:.2f} МБ > {MAX_FILE_SIZE_MB} МБ")
-
-    # Формат
-    ext = os.path.splitext(filename)[1].lower()
-    results["format_ok"] = ext in ALLOWED_EXTENSIONS
-    if not results["format_ok"]:
-        results["details"].append(f"❌ Формат {ext} не поддерживается. Допустимы: {', '.join(ALLOWED_EXTENSIONS)}")
-
-    # Открытие изображения
     try:
-        img_pil = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        results["width"], results["height"] = img_pil.size
-    except Exception as e:
-        results["details"].append(f"❌ Не удалось открыть изображение: {e}")
-        results["verdict"] = "Невозможно проверить"
-        return results
+        if is_compressed:
+            results["details"].append("⚠️ Изображение получено как сжатое фото. Размеры и качество могут быть искажены. Рекомендуется отправить файлом (как документ).")
 
-    # Размер и соотношение сторон
-    results["dimensions_ok"] = (results["width"] == TARGET_WIDTH and results["height"] == TARGET_HEIGHT)
-    if not results["dimensions_ok"]:
-        results["details"].append(f"⚠️ Размер {results['width']}x{results['height']} не соответствует {TARGET_WIDTH}x{TARGET_HEIGHT}")
+        # Размер файла
+        file_size_bytes = len(image_bytes)
+        results["file_size_mb"] = file_size_bytes / (1024 * 1024)
+        results["file_size_ok"] = results["file_size_mb"] <= MAX_FILE_SIZE_MB
+        if not results["file_size_ok"]:
+            results["details"].append(f"⚠️ Размер файла {results['file_size_mb']:.2f} МБ > {MAX_FILE_SIZE_MB} МБ")
 
-    actual_ratio = results["width"] / results["height"] if results["height"] else 0
-    results["aspect_ratio_ok"] = abs(actual_ratio - ASPECT_RATIO) < 0.01
-    if not results["aspect_ratio_ok"]:
-        results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
+        # Формат проверяем по сигнатуре (магическим байтам) или расширению, но здесь просто по расширению для простоты
+        ext = os.path.splitext(filename)[1].lower()
+        # Допустим, если расширение корректно
+        results["format_ok"] = ext in {'.jpg', '.jpeg', '.png'}
+        if not results["format_ok"]:
+            results["details"].append(f"❌ Формат {ext} не поддерживается. Допустимы: .jpg, .jpeg, .png")
 
-    # OCR текста
-    text = ""
-    if TESSERACT_AVAILABLE:
+        # Открытие изображения
         try:
-            img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-            text = pytesseract.image_to_string(gray, lang='rus+eng').strip()
-            results["ocr_text"] = text
+            img_pil = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            results["width"], results["height"] = img_pil.size
         except Exception as e:
-            results["details"].append(f"⚠️ Ошибка распознавания текста: {e}")
-    else:
-        results["details"].append("ℹ️ Tesseract OCR не установлен на сервере. Проверка текста отключена.")
+            results["details"].append(f"❌ Не удалось открыть изображение: {e}")
+            results["verdict"] = "Невозможно проверить"
+            return results
 
-    # Проверка наличия текста
-    if TESSERACT_AVAILABLE and text:
-        results["has_text"] = True
-    else:
-        results["has_text"] = False
+        # Размер и соотношение сторон
+        results["dimensions_ok"] = (results["width"] == TARGET_WIDTH and results["height"] == TARGET_HEIGHT)
+        if not results["dimensions_ok"]:
+            results["details"].append(f"⚠️ Размер {results['width']}x{results['height']} не соответствует {TARGET_WIDTH}x{TARGET_HEIGHT}")
+
+        actual_ratio = results["width"] / results["height"] if results["height"] else 0
+        results["aspect_ratio_ok"] = abs(actual_ratio - ASPECT_RATIO) < 0.01
+        if not results["aspect_ratio_ok"]:
+            results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
+
+        # OCR текста
+        text = ""
         if TESSERACT_AVAILABLE:
-            results["details"].append("❌ На баннере не обнаружен текст!")
+            try:
+                img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+                text = pytesseract.image_to_string(gray, lang='rus+eng').strip()
+                results["ocr_text"] = text
+            except Exception as e:
+                results["details"].append(f"⚠️ Ошибка распознавания текста: {e}")
         else:
-            results["details"].append("❌ OCR недоступен, текст не может быть проверен!")
+            results["details"].append("ℹ️ Tesseract OCR не установлен на сервере. Проверка текста отключена.")
 
-    # Площадь текстового блока
-    text_area_percent = 0
-    if TESSERACT_AVAILABLE and text:
-        try:
-            data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
-            boxes = 0
-            total_area = results["width"] * results["height"]
-            for i in range(len(data['text'])):
-                if int(data['conf'][i]) > 30:
-                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    boxes += w * h
-            text_area_percent = (boxes / total_area) * 100 if total_area else 0
-            results["text_block_area_ok"] = text_area_percent <= MAX_TEXT_AREA_PERCENT
-            if not results["text_block_area_ok"]:
-                results["details"].append(f"⚠️ Текстовый блок занимает {text_area_percent:.1f}% (макс. {MAX_TEXT_AREA_PERCENT}%)")
-        except Exception as e:
-            results["details"].append(f"⚠️ Не удалось оценить площадь текста: {e}")
-            results["text_block_area_ok"] = True
-    else:
-        results["text_block_area_ok"] = True
-
-    # Проверка цвета текста (новая логика с эрозией)
-    if TESSERACT_AVAILABLE and text:
-        text_color_issues = []
-        try:
-            data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
-            for i in range(len(data['text'])):
-                if int(data['conf'][i]) > 30:
-                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    if w > 5 and h > 5:
-                        # Определяем локальный фон
-                        padding = 15
-                        x1 = max(0, x - padding)
-                        y1 = max(0, y - padding)
-                        x2 = min(img_pil.width, x + w + padding)
-                        y2 = min(img_pil.height, y + h + padding)
-                        bg_region = img_pil.crop((x1, y1, x2, y2)).convert('L')
-                        bg_mean = np.array(bg_region).mean()
-                        local_bg_light = bg_mean > 128
-
-                        crop = img_pil.crop((x, y, x+w, y+h))
-                        text_color = extract_text_color(crop, local_bg_light)
-
-                        if not is_color_allowed(text_color, local_bg_light):
-                            expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
-                            text_color_issues.append(f"{text_color} (ожидался {expected})")
-
-            if text_color_issues:
-                results["text_color_ok"] = False
-                examples = text_color_issues[:3]
-                results["details"].append(f"⚠️ Цвет текста не соответствует гайду. Примеры: {', '.join(examples)}")
+        # Проверка наличия текста
+        if TESSERACT_AVAILABLE and text:
+            results["has_text"] = True
+        else:
+            results["has_text"] = False
+            if TESSERACT_AVAILABLE:
+                results["details"].append("❌ На баннере не обнаружен текст!")
             else:
+                results["details"].append("❌ OCR недоступен, текст не может быть проверен!")
+
+        # Площадь текстового блока
+        text_area_percent = 0
+        if TESSERACT_AVAILABLE and text:
+            try:
+                data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
+                boxes = 0
+                total_area = results["width"] * results["height"]
+                for i in range(len(data['text'])):
+                    if int(data['conf'][i]) > 30:
+                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                        boxes += w * h
+                text_area_percent = (boxes / total_area) * 100 if total_area else 0
+                results["text_block_area_ok"] = text_area_percent <= MAX_TEXT_AREA_PERCENT
+                if not results["text_block_area_ok"]:
+                    results["details"].append(f"⚠️ Текстовый блок занимает {text_area_percent:.1f}% (макс. {MAX_TEXT_AREA_PERCENT}%)")
+            except Exception as e:
+                results["details"].append(f"⚠️ Не удалось оценить площадь текста: {e}")
+                results["text_block_area_ok"] = True
+        else:
+            results["text_block_area_ok"] = True
+
+        # Проверка цвета текста
+        if TESSERACT_AVAILABLE and text:
+            text_color_issues = []
+            try:
+                data = pytesseract.image_to_data(gray, lang='rus+eng', output_type=pytesseract.Output.DICT)
+                for i in range(len(data['text'])):
+                    if int(data['conf'][i]) > 30:
+                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                        if w > 5 and h > 5:
+                            padding = 15
+                            x1 = max(0, x - padding)
+                            y1 = max(0, y - padding)
+                            x2 = min(img_pil.width, x + w + padding)
+                            y2 = min(img_pil.height, y + h + padding)
+                            bg_region = img_pil.crop((x1, y1, x2, y2)).convert('L')
+                            bg_mean = np.array(bg_region).mean()
+                            local_bg_light = bg_mean > 128
+
+                            crop = img_pil.crop((x, y, x+w, y+h))
+                            text_color = extract_text_color(crop, local_bg_light)
+
+                            if not is_color_allowed(text_color, local_bg_light):
+                                expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
+                                text_color_issues.append(f"{text_color} (ожидался {expected})")
+
+                if text_color_issues:
+                    results["text_color_ok"] = False
+                    examples = text_color_issues[:3]
+                    results["details"].append(f"⚠️ Цвет текста не соответствует гайду. Примеры: {', '.join(examples)}")
+                else:
+                    results["text_color_ok"] = True
+            except Exception as e:
                 results["text_color_ok"] = True
-        except Exception as e:
+                results["details"].append(f"⚠️ Не удалось проверить цвет текста: {e}")
+        else:
             results["text_color_ok"] = True
-            results["details"].append(f"⚠️ Не удалось проверить цвет текста: {e}")
-    else:
-        results["text_color_ok"] = True
 
-    # Проверка фона
-    bg_issues = is_background_bad(img_pil)
-    results["background_ok"] = len(bg_issues) == 0
-    if not results["background_ok"]:
-        results["details"].append(f"⚠️ Проблемы с фоном: {', '.join(bg_issues)}")
+        # Проверка фона
+        bg_issues = is_background_bad(img_pil)
+        results["background_ok"] = len(bg_issues) == 0
+        if not results["background_ok"]:
+            results["details"].append(f"⚠️ Проблемы с фоном: {', '.join(bg_issues)}")
 
-    # Проверка логотипа
-    logo_found, logo_msg = detect_logo_pyaterochka(img_pil)
-    results["logo_ok"] = not logo_found
-    if logo_found:
-        results["details"].append(f"❌ {logo_msg}")
+        # Проверка логотипа
+        logo_found, logo_msg = detect_logo_pyaterochka(img_pil)
+        results["logo_ok"] = not logo_found
+        if logo_found:
+            results["details"].append(f"❌ {logo_msg}")
 
-    # Текстовые правила
-    if TESSERACT_AVAILABLE and text:
-        text_style_issues = check_text_styles(text)
-        results["text_rules_ok"] = len(text_style_issues) == 0
-        if not results["text_rules_ok"]:
-            results["details"].extend([f"⚠️ {issue}" for issue in text_style_issues])
+        # Текстовые правила
+        if TESSERACT_AVAILABLE and text:
+            text_style_issues = check_text_styles(text)
+            results["text_rules_ok"] = len(text_style_issues) == 0
+            if not results["text_rules_ok"]:
+                results["details"].extend([f"⚠️ {issue}" for issue in text_style_issues])
 
-        banner_type = 'xs_s' if text_area_percent < 25 else 'm_l'
-        char_ok, char_msg = check_char_count(text, banner_type)
-        results["char_count_ok"] = char_ok
-        if not char_ok:
-            results["details"].append(f"⚠️ {char_msg}")
-    else:
-        results["text_rules_ok"] = True
-        results["char_count_ok"] = True
+            banner_type = 'xs_s' if text_area_percent < 25 else 'm_l'
+            char_ok, char_msg = check_char_count(text, banner_type)
+            results["char_count_ok"] = char_ok
+            if not char_ok:
+                results["details"].append(f"⚠️ {char_msg}")
+        else:
+            results["text_rules_ok"] = True
+            results["char_count_ok"] = True
 
-    # Доп. предупреждение
-    results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам. Свяжитесь с [Николаем Кучкаровым](https://t.me/samuraydesign).")
+        # Доп. предупреждение
+        results["details"].append("ℹ️ Требуется ручная проверка имиджа на соответствие стилистическим запретам. Свяжитесь с [Николаем Кучкаровым](https://t.me/samuraydesign).")
 
-    # Вердикт
-    critical = ["file_size_ok", "format_ok", "dimensions_ok", "aspect_ratio_ok",
-                "text_block_area_ok", "text_color_ok", "background_ok", "logo_ok",
-                "text_rules_ok", "char_count_ok", "has_text"]
-    if all(results.get(k, False) for k in critical):
-        results["verdict"] = "✅ Баннер соответствует основным требованиям гайдов Пятёрочки!"
-    else:
-        results["verdict"] = "❌ Баннер не соответствует гайдам. Смотрите детали."
+        # Вердикт
+        critical = ["file_size_ok", "format_ok", "dimensions_ok", "aspect_ratio_ok",
+                    "text_block_area_ok", "text_color_ok", "background_ok", "logo_ok",
+                    "text_rules_ok", "char_count_ok", "has_text"]
+        if all(results.get(k, False) for k in critical):
+            results["verdict"] = "✅ Баннер соответствует основным требованиям гайдов Пятёрочки!"
+        else:
+            results["verdict"] = "❌ Баннер не соответствует гайдам. Смотрите детали."
+
+    except Exception as e:
+        logger.exception("Ошибка анализа изображения")
+        results["verdict"] = "❌ Внутренняя ошибка анализа"
+        results["details"].append(f"❌ Произошла ошибка: {e}")
 
     return results
+
+# ---------- АСИНХРОННАЯ ОБЁРТКА ДЛЯ ТЕЛЕГРАМ ----------
+async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, analyze_image_sync, image_bytes, filename, is_compressed)
 
 # ---------- ОБРАБОТЧИКИ TELEGRAM ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -410,14 +436,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
-    if not document.mime_type or not document.mime_type.startswith('image/'):
-        await update.message.reply_text("❌ Пожалуйста, отправьте изображение.")
+    if not document.mime_type or document.mime_type not in ALLOWED_MIME_TYPES:
+        await update.message.reply_text("❌ Пожалуйста, отправьте изображение в формате JPEG или PNG.")
         return
     await update.message.reply_text("🔍 Анализирую оригинальный файл...")
     file = await document.get_file()
     image_bytes = await file.download_as_bytearray()
     results = await analyze_image(image_bytes, filename=document.file_name or "image", is_compressed=False)
     await send_results(update, results)
+
+def split_long_message(text: str, max_len: int = 4000) -> list:
+    """Разбивает длинное сообщение на части по строкам, сохраняя целостность Markdown."""
+    parts = []
+    current = ""
+    for line in text.split('\n'):
+        if len(current) + len(line) + 1 > max_len:
+            parts.append(current)
+            current = line
+        else:
+            if current:
+                current += '\n' + line
+            else:
+                current = line
+    if current:
+        parts.append(current)
+    return parts
 
 async def send_results(update: Update, results: dict):
     status_emoji = lambda ok: "✅" if ok else "❌"
@@ -442,11 +485,16 @@ async def send_results(update: Update, results: dict):
     ])
     if results['details']:
         lines.append("\n📋 *Подробности:*")
-        lines.extend([f"• {d}" for d in results['details']])
+        # Экранируем детали, т.к. в них могут быть спецсимволы
+        lines.extend([f"• {escape_markdown(d)}" for d in results['details']])
     if results.get('ocr_text'):
-        lines.append(f"\n📝 *Распознанный текст:*\n{results['ocr_text'][:200]}...")
+        escaped_text = escape_markdown(results['ocr_text'][:200])
+        lines.append(f"\n📝 *Распознанный текст:*\n{escaped_text}...")
 
-    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+    full_text = "\n".join(lines)
+    # Разбиваем на части, если превышает лимит
+    for part in split_long_message(full_text):
+        await update.message.reply_text(part, parse_mode='MarkdownV2')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
@@ -462,7 +510,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (эрозия маски текста)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (исправленная версия)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
