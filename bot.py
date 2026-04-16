@@ -90,45 +90,85 @@ def is_color_allowed(rgb, bg_is_light):
         tolerance = COLOR_TOLERANCE_LIGHT
     return color_distance(rgb, target) <= tolerance
 
-def preprocess_for_ocr(image_pil):
-    """Улучшенная предобработка для OCR."""
+def preprocess_variants(image_pil):
+    """Возвращает список кортежей (название, изображение для OCR)."""
     img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    variants = []
 
-    # Повышение контраста
+    # 1. Обычный grayscale
+    variants.append(("gray", gray))
+
+    # 2. CLAHE (улучшение контраста)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     enhanced = clahe.apply(gray)
+    variants.append(("clahe", enhanced))
 
-    # Адаптивная бинаризация
+    # 3. Адаптивная бинаризация
     binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY, 11, 2)
-    return binary
+    variants.append(("binary", binary))
 
-def run_ocr(image_pil):
-    """Запуск OCR с оптимизированными настройками."""
-    if not TESSERACT_AVAILABLE:
-        return "", None
-    processed = preprocess_for_ocr(image_pil)
+    return variants
+
+def ocr_with_confidence(img):
+    """Возвращает (текст, data, средний confidence)."""
     custom_config = r'--oem 3 --psm 6 -l rus+eng'
     try:
-        text = pytesseract.image_to_string(processed, config=custom_config).strip()
-        data = pytesseract.image_to_data(processed, config=custom_config,
+        data = pytesseract.image_to_data(img, config=custom_config,
                                          output_type=pytesseract.Output.DICT)
-        # Удаление дубликатов строк и мусора
-        lines = text.split('\n')
-        clean_lines = []
-        seen = set()
-        for line in lines:
-            clean = line.strip()
-            # Оставляем строки, где есть хотя бы одна буква
-            if clean and re.search(r'[А-Яа-яA-Za-z]', clean) and clean not in seen:
-                seen.add(clean)
-                clean_lines.append(clean)
-        text = '\n'.join(clean_lines)
-        return text, data
+        text = pytesseract.image_to_string(img, config=custom_config).strip()
+        confs = []
+        for i in range(len(data['text'])):
+            word = data['text'][i].strip()
+            if word and int(data['conf'][i]) > 30:
+                confs.append(int(data['conf'][i]))
+        avg_conf = sum(confs) / len(confs) if confs else 0
+        return text, data, avg_conf
     except Exception as e:
         logger.error(f"OCR error: {e}")
+        return "", None, 0
+
+def clean_ocr_text(text):
+    """Удаляет строки с малой долей буквенных символов и дубликаты."""
+    lines = text.split('\n')
+    clean_lines = []
+    seen = set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Подсчёт буквенных символов (кириллица + латиница)
+        letters = sum(1 for ch in line if ch.isalpha())
+        ratio = letters / len(line) if line else 0
+        if ratio >= 0.5 and line not in seen:
+            seen.add(line)
+            clean_lines.append(line)
+    return '\n'.join(clean_lines)
+
+def run_ocr_best(image_pil):
+    """Пробует несколько вариантов и выбирает лучший по качеству."""
+    if not TESSERACT_AVAILABLE:
         return "", None
+
+    variants = preprocess_variants(image_pil)
+    best_text = ""
+    best_data = None
+    best_score = -1
+
+    for name, img in variants:
+        text, data, avg_conf = ocr_with_confidence(img)
+        words = text.split()
+        # Оценка: количество слов * средняя уверенность
+        score = len(words) * avg_conf
+        if score > best_score:
+            best_score = score
+            best_text = text
+            best_data = data
+
+    # Очистка текста от мусора и дубликатов
+    best_text = clean_ocr_text(best_text)
+    return best_text, best_data
 
 def extract_text_color_simple(image_rgb, bbox):
     """Простой и быстрый метод определения цвета текста."""
@@ -136,7 +176,7 @@ def extract_text_color_simple(image_rgb, bbox):
     if w < 5 or h < 5:
         return None, None
 
-    # Расширяем область для анализа фона
+    # Расширенная область для анализа фона
     pad = 15
     x1 = max(0, x - pad)
     y1 = max(0, y - pad)
@@ -145,28 +185,24 @@ def extract_text_color_simple(image_rgb, bbox):
     crop = image_rgb.crop((x1, y1, x2, y2))
     crop_np = np.array(crop)
 
-    # Средний цвет области (грубый фон)
+    # Средний цвет фона
     avg_color = np.mean(crop_np.reshape(-1, 3), axis=0)
     bg_brightness = 0.299 * avg_color[0] + 0.587 * avg_color[1] + 0.114 * avg_color[2]
     bg_is_light = bg_brightness > 128
 
-    # Вырезаем точную область текста
+    # Вырезаем область текста
     text_crop = image_rgb.crop((x, y, x+w, y+h))
     text_np = np.array(text_crop)
     gray = cv2.cvtColor(text_np, cv2.COLOR_RGB2GRAY)
 
-    # Порог для отделения текста от фона
+    # Порог для выделения пикселей текста
     if bg_is_light:
-        # Тёмный текст
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     else:
-        # Светлый текст
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Пиксели текста
     text_pixels = text_np[thresh == 255]
     if len(text_pixels) == 0:
-        # Если не выделились, берём средний цвет всей области текста
         stat = ImageStat.Stat(text_crop)
         return tuple(map(int, stat.mean[:3])), bg_is_light
 
@@ -314,8 +350,8 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     if not results["aspect_ratio_ok"]:
         results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-    # OCR текста
-    text, data = run_ocr(img_pil)
+    # OCR текста (выбор лучшего из вариантов)
+    text, data = run_ocr_best(img_pil)
     results["ocr_text"] = text
     results["has_text"] = bool(text.strip())
     if not results["has_text"]:
@@ -344,7 +380,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (простой метод)
+    # Проверка цвета текста
     if data is not None and results["has_text"]:
         text_color_issues = []
         try:
@@ -509,7 +545,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (стабильная версия)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (гибридный OCR)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
