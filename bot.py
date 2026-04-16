@@ -10,7 +10,6 @@ import pytesseract
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from colorthief import ColorThief
-from sklearn.cluster import KMeans
 
 # Настройка логирования
 logging.basicConfig(
@@ -47,7 +46,7 @@ LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
 # Допустимые отклонения цвета
 COLOR_TOLERANCE_DARK = 180
-COLOR_TOLERANCE_LIGHT = 150
+COLOR_TOLERANCE_LIGHT = 180  # увеличен для светлых оттенков
 
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
@@ -171,18 +170,45 @@ def detect_logo_pyaterochka(image):
             break
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
-def get_text_color_kmeans(crop_rgb):
-    """Определяет основной цвет текста с помощью KMeans (2 кластера)."""
-    pixels = crop_rgb.reshape(-1, 3).astype(np.float32)
-    if len(pixels) < 10:
-        return None
-    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(pixels)
-    centers = kmeans.cluster_centers_.astype(int)
-    # Определяем, какой кластер - текст: обычно это менее частый цвет (текст занимает меньше пикселей)
-    unique, counts = np.unique(labels, return_counts=True)
-    text_label = unique[np.argmin(counts)]  # меньший по площади - текст
-    return tuple(centers[text_label])
+def extract_text_color(crop_img, local_bg_light):
+    """
+    Извлекает чистый цвет текста из области crop (PIL Image).
+    Возвращает кортеж (R, G, B).
+    """
+    # Конвертируем в grayscale и бинаризуем
+    gray = crop_img.convert('L')
+    _, mask = cv2.threshold(np.array(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Предполагаем, что текст темнее фона, если фон светлый, и наоборот
+    if local_bg_light:
+        text_pixels_mask = mask < 128
+    else:
+        text_pixels_mask = mask > 128
+    
+    # Если маска пуста, пробуем инвертировать
+    if np.sum(text_pixels_mask) < 5:
+        text_pixels_mask = ~text_pixels_mask
+    
+    # Применяем эрозию для удаления краёв (ядро 2x2)
+    kernel = np.ones((2, 2), np.uint8)
+    eroded = cv2.erode(text_pixels_mask.astype(np.uint8), kernel, iterations=1)
+    final_mask = eroded.astype(bool)
+    
+    crop_np = np.array(crop_img)
+    if np.sum(final_mask) > 10:
+        text_pixels = crop_np[final_mask]
+        # Медиана по каждому каналу
+        median_color = tuple(np.median(text_pixels, axis=0).astype(int))
+        return median_color
+    else:
+        # Если после эрозии не осталось пикселей, берём медиану по исходной маске
+        if np.sum(text_pixels_mask) > 10:
+            text_pixels = crop_np[text_pixels_mask]
+            return tuple(np.median(text_pixels, axis=0).astype(int))
+        else:
+            # Fallback: среднее по всей области
+            stat = ImageStat.Stat(crop_img)
+            return tuple(map(int, stat.mean[:3]))
 
 # ---------- ОСНОВНОЙ АНАЛИЗ ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
@@ -286,7 +312,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (с KMeans)
+    # Проверка цвета текста (с новым методом извлечения)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -295,6 +321,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     if w > 5 and h > 5:
+                        # Определяем локальный фон
                         padding = 15
                         x1 = max(0, x - padding)
                         y1 = max(0, y - padding)
@@ -305,10 +332,9 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                         local_bg_light = bg_mean > 128
 
                         crop = img_pil.crop((x, y, x+w, y+h))
-                        crop_np = np.array(crop)
-                        text_color = get_text_color_kmeans(crop_np)
-                        if text_color is None:
-                            continue
+                        # Извлекаем цвет новым методом
+                        text_color = extract_text_color(crop, local_bg_light)
+
                         if not is_color_allowed(text_color, local_bg_light):
                             expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
                             text_color_issues.append(f"{text_color} (ожидался {expected})")
@@ -447,7 +473,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (KMeans для цвета текста)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (эрозия маски текста)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
