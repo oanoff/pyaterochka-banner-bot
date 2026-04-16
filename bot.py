@@ -170,22 +170,80 @@ def detect_logo_pyaterochka(image):
             break
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
-def extract_text_color(crop_img):
+def extract_text_color_advanced(image_rgb, bbox):
     """
-    Простой и надёжный метод: средний цвет центральной области (60% ширины и высоты).
+    Улучшенное определение цвета текста.
+    bbox: (x, y, w, h) – bounding box от Tesseract.
+    Возвращает средний цвет текста и флаг, светлый ли фон.
     """
-    w, h = crop_img.size
-    # Центральные 60%
-    left = int(w * 0.2)
-    top = int(h * 0.2)
-    right = int(w * 0.8)
-    bottom = int(h * 0.8)
-    if right <= left or bottom <= top:
-        core = crop_img
+    x, y, w, h = bbox
+    if w < 5 or h < 5:
+        return None, None
+
+    # Обрезаем область текста с небольшим запасом (padding 5px)
+    pad = 5
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(image_rgb.width, x + w + pad)
+    y2 = min(image_rgb.height, y + h + pad)
+    crop = image_rgb.crop((x1, y1, x2, y2))
+    crop_np = np.array(crop)  # RGB
+
+    # Определяем доминирующий цвет фона вокруг текста
+    # Расширим область еще немного и вычтем внутренний прямоугольник текста
+    bg_pad = 15
+    bg_x1 = max(0, x - bg_pad)
+    bg_y1 = max(0, y - bg_pad)
+    bg_x2 = min(image_rgb.width, x + w + bg_pad)
+    bg_y2 = min(image_rgb.height, y + h + bg_pad)
+    bg_crop = image_rgb.crop((bg_x1, bg_y1, bg_x2, bg_y2))
+    bg_np = np.array(bg_crop)
+
+    # Создаем маску: все пиксели внутри bbox исключаем (они могут содержать текст)
+    mask = np.ones(bg_np.shape[:2], dtype=bool)
+    # Пересчет координат bbox относительно bg_crop
+    rel_x1 = max(0, x - bg_x1)
+    rel_y1 = max(0, y - bg_y1)
+    rel_x2 = min(bg_np.shape[1], rel_x1 + w)
+    rel_y2 = min(bg_np.shape[0], rel_y1 + h)
+    if rel_x2 > rel_x1 and rel_y2 > rel_y1:
+        mask[rel_y1:rel_y2, rel_x1:rel_x2] = False
+
+    # Если после исключения текста осталось слишком мало фона, используем всю область
+    if np.sum(mask) < 50:
+        bg_pixels = bg_np.reshape(-1, 3)
     else:
-        core = crop_img.crop((left, top, right, bottom))
-    stat = ImageStat.Stat(core)
-    return tuple(map(int, stat.mean[:3]))
+        bg_pixels = bg_np[mask]
+
+    # Определяем средний цвет фона и его яркость
+    avg_bg_color = np.mean(bg_pixels, axis=0)
+    bg_brightness = 0.299 * avg_bg_color[0] + 0.587 * avg_bg_color[1] + 0.114 * avg_bg_color[2]
+    bg_is_light = bg_brightness > 128
+
+    # Теперь выделяем пиксели текста внутри crop
+    # Применяем пороговую обработку по яркости, инвертированную в зависимости от фона
+    gray_crop = cv2.cvtColor(crop_np, cv2.COLOR_RGB2GRAY)
+    if bg_is_light:
+        # Текст темный, поэтому берем пиксели ниже порога
+        _, thresh = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    else:
+        # Текст светлый, берем пиксели выше порога
+        _, thresh = cv2.threshold(gray_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Морфологическое открытие для удаления шума
+    kernel = np.ones((2,2), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # Находим пиксели, принадлежащие тексту
+    text_pixels = crop_np[thresh == 255]
+    if len(text_pixels) == 0:
+        # Если текст не выделился, возвращаем средний цвет всей области (fallback)
+        stat = ImageStat.Stat(crop)
+        return tuple(map(int, stat.mean[:3])), bg_is_light
+
+    # Вычисляем средний цвет текста
+    avg_text_color = np.mean(text_pixels, axis=0)
+    return tuple(map(int, avg_text_color)), bg_is_light
 
 # ---------- ОСНОВНОЙ АНАЛИЗ ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
@@ -289,7 +347,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (упрощённый метод через ядро)
+    # Проверка цвета текста (улучшенный метод)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -298,21 +356,13 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                 if int(data['conf'][i]) > 30:
                     x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     if w > 5 and h > 5:
-                        # Определяем локальный фон
-                        padding = 15
-                        x1 = max(0, x - padding)
-                        y1 = max(0, y - padding)
-                        x2 = min(img_pil.width, x + w + padding)
-                        y2 = min(img_pil.height, y + h + padding)
-                        bg_region = img_pil.crop((x1, y1, x2, y2)).convert('L')
-                        bg_mean = np.array(bg_region).mean()
-                        local_bg_light = bg_mean > 128
-
-                        crop = img_pil.crop((x, y, x+w, y+h))
-                        text_color = extract_text_color(crop)
-
-                        if not is_color_allowed(text_color, local_bg_light):
-                            expected = TEXT_COLOR_DARK if local_bg_light else TEXT_COLOR_LIGHT
+                        bbox = (x, y, w, h)
+                        text_color, bg_is_light = extract_text_color_advanced(img_pil, bbox)
+                        if text_color is None:
+                            continue
+                        # Проверяем соответствие
+                        if not is_color_allowed(text_color, bg_is_light):
+                            expected = TEXT_COLOR_DARK if bg_is_light else TEXT_COLOR_LIGHT
                             text_color_issues.append(f"{text_color} (ожидался {expected})")
 
             if text_color_issues:
@@ -449,7 +499,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (упрощённый анализ цвета)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (улучшенный анализ цвета)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
