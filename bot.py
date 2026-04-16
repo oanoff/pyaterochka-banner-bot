@@ -4,6 +4,7 @@ import re
 import asyncio
 import logging
 import traceback
+import html
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 import cv2
@@ -62,12 +63,9 @@ MAX_CHARS_SUBTITLE_M_L = 55
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
-def escape_markdown(text: str) -> str:
-    """Экранирует все зарезервированные символы MarkdownV2."""
-    if not text:
-        return text
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', text)
+def escape_html(text: str) -> str:
+    """Экранирует спецсимволы HTML."""
+    return html.escape(text, quote=False)
 
 def rgb_to_hsl(r, g, b):
     r, g, b = r/255.0, g/255.0, b/255.0
@@ -411,7 +409,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Я — агент проверки баннеров для приложения Пятёрочки.\n\n"
-        "📌 *ВАЖНО:* Для точной проверки отправляйте баннер *как документ (файл)*, "
+        "📌 <b>ВАЖНО:</b> Для точной проверки отправляйте баннер <b>как документ (файл)</b>, "
         "а не как фото. Telegram сжимает фото, что искажает размеры и качество.\n\n"
         "Я проверю:\n"
         f"• Размер: {TARGET_WIDTH}x{TARGET_HEIGHT} px (строго)\n"
@@ -420,7 +418,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Фон: без запрещённых цветов и текстур\n"
         f"• Логотип Пятёрочки — запрещён\n"
         f"• Лимит символов и наличие текста",
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,46 +474,46 @@ async def send_results(update: Update, results: dict):
     try:
         status_emoji = lambda ok: "✅" if ok else "❌"
 
-        width = escape_markdown(str(results['width']))
-        height = escape_markdown(str(results['height']))
-        ratio = escape_markdown(f"{results['width']/results['height']:.3f}")
-        file_size = escape_markdown(f"{results['file_size_mb']:.2f}")
-        verdict = escape_markdown(results['verdict'])
+        width = str(results['width'])
+        height = str(results['height'])
+        ratio = f"{results['width']/results['height']:.3f}"
+        file_size = f"{results['file_size_mb']:.2f}"
+        verdict = escape_html(results['verdict'])
 
         lines = [
-            "*Результаты проверки баннера:*\n",
+            "<b>Результаты проверки баннера:</b>\n",
         ]
         if results.get("is_compressed"):
-            lines.append("⚠️ *Внимание:* анализ проводился по сжатому фото. Результаты могут быть неточными.\n")
+            lines.append("⚠️ <b>Внимание:</b> анализ проводился по сжатому фото. Результаты могут быть неточными.\n")
         lines.extend([
-            f"📏 *Размер:* {width}x{height} {status_emoji(results['dimensions_ok'])}",
-            f"📐 *Соотношение:* {ratio} {status_emoji(results['aspect_ratio_ok'])}",
-            f"💾 *Размер файла:* {file_size} МБ {status_emoji(results['file_size_ok'])}",
-            f"🖼 *Формат:* {status_emoji(results['format_ok'])}",
-            f"📄 *Наличие текста:* {status_emoji(results['has_text'])}",
-            f"📝 *Площадь текста:* {status_emoji(results['text_block_area_ok'])}",
-            f"🎨 *Цвет текста:* {status_emoji(results['text_color_ok'])}",
-            f"🌄 *Фон:* {status_emoji(results['background_ok'])}",
-            f"🏷 *Логотип:* {status_emoji(results['logo_ok'])}",
-            f"🔤 *Текстовые правила:* {status_emoji(results['text_rules_ok'])}",
-            f"🔢 *Лимит символов:* {status_emoji(results['char_count_ok'])}",
-            f"\n*Вердикт:* {verdict}",
+            f"📏 <b>Размер:</b> {width}x{height} {status_emoji(results['dimensions_ok'])}",
+            f"📐 <b>Соотношение:</b> {ratio} {status_emoji(results['aspect_ratio_ok'])}",
+            f"💾 <b>Размер файла:</b> {file_size} МБ {status_emoji(results['file_size_ok'])}",
+            f"🖼 <b>Формат:</b> {status_emoji(results['format_ok'])}",
+            f"📄 <b>Наличие текста:</b> {status_emoji(results['has_text'])}",
+            f"📝 <b>Площадь текста:</b> {status_emoji(results['text_block_area_ok'])}",
+            f"🎨 <b>Цвет текста:</b> {status_emoji(results['text_color_ok'])}",
+            f"🌄 <b>Фон:</b> {status_emoji(results['background_ok'])}",
+            f"🏷 <b>Логотип:</b> {status_emoji(results['logo_ok'])}",
+            f"🔤 <b>Текстовые правила:</b> {status_emoji(results['text_rules_ok'])}",
+            f"🔢 <b>Лимит символов:</b> {status_emoji(results['char_count_ok'])}",
+            f"\n<b>Вердикт:</b> {verdict}",
         ])
         if results['details']:
-            lines.append("\n📋 *Подробности:*")
-            lines.extend([f"• {escape_markdown(d)}" for d in results['details']])
+            lines.append("\n📋 <b>Подробности:</b>")
+            for d in results['details']:
+                lines.append(f"• {escape_html(d)}")
         if results.get('ocr_text'):
-            escaped_text = escape_markdown(results['ocr_text'][:200])
-            lines.append(f"\n📝 *Распознанный текст:*\n{escaped_text}...")
+            escaped_text = escape_html(results['ocr_text'][:200])
+            lines.append(f"\n📝 <b>Распознанный текст:</b>\n{escaped_text}...")
 
         full_text = "\n".join(lines)
         logger.info(f"Отправка результатов, длина сообщения: {len(full_text)}")
         for part in split_long_message(full_text):
-            await update.message.reply_text(part, parse_mode='MarkdownV2')
+            await update.message.reply_text(part, parse_mode='HTML')
     except Exception as e:
         logger.exception("Ошибка в send_results")
-        # Fallback: отправляем без форматирования
-        plain_text = "\n".join(lines).replace("*", "")
+        plain_text = "\n".join(lines).replace("<b>", "").replace("</b>", "")
         await update.message.reply_text(plain_text)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -532,7 +530,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (с расширенным логированием)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (HTML-форматирование)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
