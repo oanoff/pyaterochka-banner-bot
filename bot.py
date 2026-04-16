@@ -3,7 +3,7 @@ import io
 import re
 import asyncio
 import logging
-from PIL import Image, ImageStat, ImageEnhance
+from PIL import Image, ImageStat
 import cv2
 import numpy as np
 import pytesseract
@@ -44,10 +44,10 @@ TEXTURE_THRESHOLD = 30
 
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# Допуски цвета (настраиваемые)
-COLOR_TOLERANCE_DARK = 60      # для тёмного текста
-COLOR_TOLERANCE_LIGHT = 60     # для светлого текста
-MAX_SATURATION_FOR_TEXT = 25   # текст не должен быть цветным
+# Допуски цвета
+COLOR_TOLERANCE_DARK = 60
+COLOR_TOLERANCE_LIGHT = 60
+MAX_SATURATION_FOR_TEXT = 25
 
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
@@ -93,52 +93,44 @@ def is_color_allowed(rgb, bg_is_light):
     return color_distance(rgb, target) <= tolerance
 
 def preprocess_for_ocr(image_pil):
-    """Создаёт несколько вариантов обработки для улучшения OCR."""
+    """Единая надёжная предобработка для OCR."""
     img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
 
-    variants = []
-
-    # 1. Обычный серый
-    variants.append(gray)
-
-    # 2. Адаптивная бинаризация
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    variants.append(thresh)
-
-    # 3. CLAHE + бинаризация
+    # Повышаем контраст
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    cl1 = clahe.apply(gray)
-    _, thresh_clahe = cv2.threshold(cl1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(thresh_clahe)
+    enhanced = clahe.apply(gray)
 
-    # 4. Инвертированный вариант (для светлого текста на тёмном)
-    inv = cv2.bitwise_not(gray)
-    _, thresh_inv = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(thresh_inv)
+    # Адаптивная бинаризация
+    binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 11, 2)
+    return binary
 
-    return variants
-
-def run_ocr_multi(image_pil):
-    """Запускает OCR на нескольких вариантах и объединяет результаты."""
-    variants = preprocess_for_ocr(image_pil)
-    all_text = ""
-    all_data = []
-    for variant in variants:
-        try:
-            text = pytesseract.image_to_string(variant, lang='rus+eng').strip()
-            data = pytesseract.image_to_data(variant, lang='rus+eng', output_type=pytesseract.Output.DICT)
-            all_text += " " + text
-            all_data.append(data)
-        except:
-            continue
-
-    # Объединяем данные: берём bounding box с наибольшим confidence для каждой области
-    # Упрощённо: возвращаем первый непустой набор данных
-    for data in all_data:
-        if any(int(c) > 30 for c in data['conf']):
-            return " ".join(all_text.split()), data
-    return "", None
+def run_ocr_single(image_pil):
+    """Запуск OCR с оптимизированными настройками."""
+    if not TESSERACT_AVAILABLE:
+        return "", None
+    processed = preprocess_for_ocr(image_pil)
+    # Используем PSM 6 (единый блок текста)
+    custom_config = r'--oem 3 --psm 6 -l rus+eng'
+    try:
+        text = pytesseract.image_to_string(processed, config=custom_config).strip()
+        data = pytesseract.image_to_data(processed, config=custom_config,
+                                         output_type=pytesseract.Output.DICT)
+        # Удаляем дубликаты строк (часто возникают из-за шума)
+        lines = text.split('\n')
+        unique_lines = []
+        seen = set()
+        for line in lines:
+            clean = line.strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                unique_lines.append(clean)
+        text = '\n'.join(unique_lines)
+        return text, data
+    except Exception as e:
+        logger.error(f"OCR error: {e}")
+        return "", None
 
 def get_background_brightness_around(image_rgb, bbox, pad=30):
     x, y, w, h = bbox
@@ -148,7 +140,6 @@ def get_background_brightness_around(image_rgb, bbox, pad=30):
     y2 = min(image_rgb.height, y + h + pad)
     crop = image_rgb.crop((x1, y1, x2, y2))
     crop_np = np.array(crop)
-    # Исключаем область текста
     mask = np.ones(crop_np.shape[:2], dtype=bool)
     rel_x1 = max(0, x - x1)
     rel_y1 = max(0, y - y1)
@@ -165,7 +156,6 @@ def extract_text_color_kmeans_robust(image_rgb, bbox):
     x, y, w, h = bbox
     if w < 5 or h < 5:
         return None, None
-
     pad = 10
     x1 = max(0, x - pad)
     y1 = max(0, y - pad)
@@ -174,46 +164,35 @@ def extract_text_color_kmeans_robust(image_rgb, bbox):
     crop = image_rgb.crop((x1, y1, x2, y2))
     crop_np = np.array(crop)
     pixels = crop_np.reshape(-1, 3).astype(np.float32)
-
     if len(pixels) < 10:
         return None, None
 
-    # Определяем, светлый ли фон вокруг
     bg_is_light, _ = get_background_brightness_around(image_rgb, bbox)
 
-    # Кластеризация с автоматическим выбором числа кластеров (2 или 3)
-    best_inertia = float('inf')
-    best_labels = None
+    # KMeans с 2 или 3 кластерами
     best_centers = None
+    best_labels = None
     for n_clusters in [2, 3]:
         kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
         labels = kmeans.fit_predict(pixels)
         centers = kmeans.cluster_centers_.astype(int)
-        # Вычисляем, какой кластер ближе к фону
         _, avg_bg = get_background_brightness_around(image_rgb, bbox, pad=5)
         dists = [np.linalg.norm(center - avg_bg) for center in centers]
         bg_cluster = np.argmin(dists)
-        # Считаем, что текст — это кластер с максимальной яркостью (если фон тёмный) или минимальной (если фон светлый)
         brightnesses = [0.299*c[0] + 0.587*c[1] + 0.114*c[2] for c in centers]
         if bg_is_light:
             text_cluster = np.argmin(brightnesses)
         else:
             text_cluster = np.argmax(brightnesses)
-        # Проверяем, что текст не совпадает с фоном
         if text_cluster == bg_cluster:
             continue
-        # Вычисляем инерцию только для пикселей текста
-        text_pixels = pixels[labels == text_cluster]
-        inertia = np.sum((text_pixels - centers[text_cluster])**2) if len(text_pixels) > 0 else float('inf')
-        if inertia < best_inertia:
-            best_inertia = inertia
-            best_centers = centers
-            best_labels = labels
+        best_centers = centers
+        best_labels = labels
+        break
 
     if best_centers is None:
         return None, None
 
-    # Определяем фон и текст
     _, avg_bg = get_background_brightness_around(image_rgb, bbox, pad=5)
     dists = [np.linalg.norm(center - avg_bg) for center in best_centers]
     bg_cluster = np.argmin(dists)
@@ -222,9 +201,7 @@ def extract_text_color_kmeans_robust(image_rgb, bbox):
         text_cluster = np.argmin(brightnesses)
     else:
         text_cluster = np.argmax(brightnesses)
-
     if text_cluster == bg_cluster:
-        # Если кластеры совпали, выбираем второй по яркости
         sorted_idx = np.argsort(brightnesses)
         if bg_is_light:
             text_cluster = sorted_idx[0] if sorted_idx[0] != bg_cluster else sorted_idx[1]
@@ -375,23 +352,11 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     if not results["aspect_ratio_ok"]:
         results["details"].append(f"⚠️ Соотношение сторон {actual_ratio:.3f} (требуется {ASPECT_RATIO:.3f})")
 
-    # OCR текста (улучшенный)
-    text = ""
-    data = None
-    if TESSERACT_AVAILABLE:
-        try:
-            text, data = run_ocr_multi(img_pil)
-            results["ocr_text"] = text
-        except Exception as e:
-            results["details"].append(f"⚠️ Ошибка распознавания текста: {e}")
-    else:
-        results["details"].append("ℹ️ Tesseract OCR не установлен на сервере. Проверка текста отключена.")
-
-    # Проверка наличия текста
-    if TESSERACT_AVAILABLE and text.strip():
-        results["has_text"] = True
-    else:
-        results["has_text"] = False
+    # OCR текста (улучшенный, без дублирования)
+    text, data = run_ocr_single(img_pil)
+    results["ocr_text"] = text
+    results["has_text"] = bool(text.strip())
+    if not results["has_text"]:
         if TESSERACT_AVAILABLE:
             results["details"].append("❌ На баннере не обнаружен текст!")
         else:
@@ -417,7 +382,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (улучшенный KMeans)
+    # Проверка цвета текста
     if data is not None and results["has_text"]:
         text_color_issues = []
         try:
@@ -567,7 +532,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
 
-    logger.info("Бот для проверки баннеров Пятёрочки запущен (улучшенный OCR + KMeans)...")
+    logger.info("Бот для проверки баннеров Пятёрочки запущен (улучшенный OCR без дубликатов)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
