@@ -3,7 +3,7 @@ import io
 import re
 import asyncio
 import logging
-from PIL import Image, ImageDraw, ImageStat
+from PIL import Image, ImageStat
 import cv2
 import numpy as np
 import pytesseract
@@ -44,9 +44,9 @@ TEXTURE_THRESHOLD = 30
 
 LOGO_TEMPLATE_PATH = "assets/pyaterochka_logo.png"
 
-# Допустимые отклонения цвета
-COLOR_TOLERANCE_DARK = 180
-COLOR_TOLERANCE_LIGHT = 180  # увеличен для светлых оттенков
+# Допустимые отклонения цвета (евклидово расстояние)
+COLOR_TOLERANCE_DARK = 80
+COLOR_TOLERANCE_LIGHT = 100
 
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
@@ -84,8 +84,8 @@ def is_color_allowed(rgb, bg_is_light):
         target = hex_to_rgb(TEXT_COLOR_DARK)
         return color_distance(rgb, target) <= COLOR_TOLERANCE_DARK
     else:
-        white = (255, 255, 255)
-        return color_distance(rgb, white) <= COLOR_TOLERANCE_LIGHT
+        target = hex_to_rgb(TEXT_COLOR_LIGHT)
+        return color_distance(rgb, target) <= COLOR_TOLERANCE_LIGHT
 
 def get_dominant_colors(image, n=3):
     temp = io.BytesIO()
@@ -170,45 +170,35 @@ def detect_logo_pyaterochka(image):
             break
     return found, "обнаружен логотип Пятёрочки (запрещено)"
 
-def extract_text_color(crop_img, local_bg_light):
+def extract_text_color(crop_img, bg_is_light):
     """
-    Извлекает чистый цвет текста из области crop (PIL Image).
-    Возвращает кортеж (R, G, B).
+    Извлекает чистый цвет текста, исключая краевые пиксели.
     """
-    # Конвертируем в grayscale и бинаризуем
     gray = crop_img.convert('L')
+    # Бинаризация Отсу
     _, mask = cv2.threshold(np.array(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # Предполагаем, что текст темнее фона, если фон светлый, и наоборот
-    if local_bg_light:
-        text_pixels_mask = mask < 128
+    if bg_is_light:
+        text_mask = mask < 128   # текст темнее фона
     else:
-        text_pixels_mask = mask > 128
-    
-    # Если маска пуста, пробуем инвертировать
-    if np.sum(text_pixels_mask) < 5:
-        text_pixels_mask = ~text_pixels_mask
-    
-    # Применяем эрозию для удаления краёв (ядро 2x2)
-    kernel = np.ones((2, 2), np.uint8)
-    eroded = cv2.erode(text_pixels_mask.astype(np.uint8), kernel, iterations=1)
+        text_mask = mask > 128   # текст светлее фона
+    if np.sum(text_mask) < 5:
+        text_mask = ~text_mask
+
+    # Эрозия для удаления 2-3 краевых пикселей (ядро 3x3)
+    kernel = np.ones((3, 3), np.uint8)
+    eroded = cv2.erode(text_mask.astype(np.uint8), kernel, iterations=1)
     final_mask = eroded.astype(bool)
-    
+
     crop_np = np.array(crop_img)
     if np.sum(final_mask) > 10:
-        text_pixels = crop_np[final_mask]
-        # Медиана по каждому каналу
-        median_color = tuple(np.median(text_pixels, axis=0).astype(int))
-        return median_color
+        pixels = crop_np[final_mask]
     else:
-        # Если после эрозии не осталось пикселей, берём медиану по исходной маске
-        if np.sum(text_pixels_mask) > 10:
-            text_pixels = crop_np[text_pixels_mask]
-            return tuple(np.median(text_pixels, axis=0).astype(int))
-        else:
-            # Fallback: среднее по всей области
-            stat = ImageStat.Stat(crop_img)
-            return tuple(map(int, stat.mean[:3]))
+        # fallback на исходную маску
+        pixels = crop_np[text_mask]
+
+    # Медиана по каждому каналу
+    median_color = tuple(np.median(pixels, axis=0).astype(int))
+    return median_color
 
 # ---------- ОСНОВНОЙ АНАЛИЗ ----------
 async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: bool = False) -> dict:
@@ -312,7 +302,7 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
     else:
         results["text_block_area_ok"] = True
 
-    # Проверка цвета текста (с новым методом извлечения)
+    # Проверка цвета текста (новая логика с эрозией)
     if TESSERACT_AVAILABLE and text:
         text_color_issues = []
         try:
@@ -332,7 +322,6 @@ async def analyze_image(image_bytes: bytes, filename: str = "", is_compressed: b
                         local_bg_light = bg_mean > 128
 
                         crop = img_pil.crop((x, y, x+w, y+h))
-                        # Извлекаем цвет новым методом
                         text_color = extract_text_color(crop, local_bg_light)
 
                         if not is_color_allowed(text_color, local_bg_light):
