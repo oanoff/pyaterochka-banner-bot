@@ -4,6 +4,7 @@ import json
 import base64
 import logging
 import requests
+import asyncio
 from PIL import Image, ImageEnhance, ImageFilter
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -16,10 +17,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-#                         ВСТАВЬТЕ СВОИ ДАННЫЕ СЮДА
+#                         ВАШИ ДАННЫЕ (УЖЕ ВСТАВЛЕНЫ)
 # ==============================================================================
-FOLDER_ID = "b1g6irlklro22jcs1i2c"     # <-- ВАШ FOLDER ID
-API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"                   # <-- ВАШ API-КЛЮЧ
+FOLDER_ID = "b1g6irlklro22jcs1i2c"
+API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"
 # ==============================================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -179,7 +180,6 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
-    # Единое сообщение, которое будет обновляться
     status_msg = await update.message.reply_text(
         f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
     )
@@ -210,22 +210,30 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
 
     final_verdict = "✅ Текст полностью соответствует гайдам!" if verdict == "ok" else "❌ Текст имеет нарушения."
     lines = [
-        f"*Результаты проверки (Yandex AI):*",
+        f"Результаты проверки (Yandex AI):",
         size_msg,
-        f"\n*Вердикт:* {final_verdict}",
+        f"",
+        f"Вердикт: {final_verdict}",
     ]
     if is_compressed:
-        lines.append("\n⚠️ *Внимание:* анализ по сжатому фото, результаты могут быть неточными.")
+        lines.append("")
+        lines.append("⚠️ Внимание: анализ по сжатому фото, результаты могут быть неточными.")
     if issues:
-        lines.append("\n*Обнаруженные проблемы:*")
+        lines.append("")
+        lines.append("Обнаруженные проблемы:")
         for issue in issues:
             lines.append(f"• {issue}")
     if recommendations:
-        lines.append(f"\n*Рекомендация:* {recommendations}")
-    lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
+        lines.append("")
+        lines.append(f"Рекомендация: {recommendations}")
+    lines.append("")
+    lines.append(f"📝 Распознанный текст:\n{ocr_text}")
 
-    # Редактируем то же сообщение с финальным результатом
-    await status_msg.edit_text("\n".join(lines), parse_mode='Markdown')
+    # Небольшая задержка для надёжности
+    await asyncio.sleep(0.5)
+
+    # Редактируем без Markdown — чистый текст гарантированно отобразится
+    await status_msg.edit_text("\n".join(lines))
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
@@ -238,7 +246,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (надёжное редактирование)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (чистый текст, без Markdown)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
