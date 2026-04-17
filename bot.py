@@ -179,26 +179,28 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
-    status_msg = await update.message.reply_text(
+    # Сообщение о начале распознавания (новое, не редактируемое)
+    await update.message.reply_text(
         f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
     )
 
     ocr_text = ocr_with_yandex(img_pil)
     if not ocr_text:
-        await status_msg.edit_text(
+        await update.message.reply_text(
             f"{size_msg}\n❌ Не удалось распознать текст. "
             "Убедитесь, что текст на баннере хорошо читается."
         )
         return
 
-    await status_msg.edit_text(
+    # Сообщение о переходе к анализу (новое)
+    await update.message.reply_text(
         f"{size_msg}\n📝 Распознанный текст:\n{ocr_text[:200]}...\n\n🤖 Анализирую с помощью YandexGPT..."
     )
 
     gpt_result = analyze_text_with_yandexgpt(ocr_text)
 
     if gpt_result is None:
-        await status_msg.edit_text(
+        await update.message.reply_text(
             f"{size_msg}\n❌ Ошибка при обращении к YandexGPT. Проверьте настройки."
         )
         return
@@ -223,6 +225,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         lines.append(f"\n*Рекомендация:* {recommendations}")
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
+    # Финальный результат — отдельное сообщение
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,9 +239,8 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (финальный)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (только новые сообщения)...")
     
-    # Явные таймауты для повышения надёжности при сетевых сбоях
     application.run_polling(
         read_timeout=30,
         write_timeout=30,
