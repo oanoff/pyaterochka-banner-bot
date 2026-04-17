@@ -4,7 +4,6 @@ import json
 import base64
 import logging
 import requests
-import asyncio
 from PIL import Image, ImageEnhance, ImageFilter
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -102,7 +101,7 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         "completionOptions": {
             "stream": False,
             "temperature": 0.1,
-            "maxTokens": "1000"
+            "maxTokens": 1000
         },
         "messages": [
             {"role": "system", "text": system_prompt},
@@ -210,30 +209,21 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
 
     final_verdict = "✅ Текст полностью соответствует гайдам!" if verdict == "ok" else "❌ Текст имеет нарушения."
     lines = [
-        f"Результаты проверки (Yandex AI):",
+        f"*Результаты проверки (Yandex AI):*",
         size_msg,
-        f"",
-        f"Вердикт: {final_verdict}",
+        f"\n*Вердикт:* {final_verdict}",
     ]
     if is_compressed:
-        lines.append("")
-        lines.append("⚠️ Внимание: анализ по сжатому фото, результаты могут быть неточными.")
+        lines.append("\n⚠️ *Внимание:* анализ по сжатому фото, результаты могут быть неточными.")
     if issues:
-        lines.append("")
-        lines.append("Обнаруженные проблемы:")
+        lines.append("\n*Обнаруженные проблемы:*")
         for issue in issues:
             lines.append(f"• {issue}")
     if recommendations:
-        lines.append("")
-        lines.append(f"Рекомендация: {recommendations}")
-    lines.append("")
-    lines.append(f"📝 Распознанный текст:\n{ocr_text}")
+        lines.append(f"\n*Рекомендация:* {recommendations}")
+    lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
-    # Небольшая задержка для надёжности
-    await asyncio.sleep(0.5)
-
-    # Редактируем без Markdown — чистый текст гарантированно отобразится
-    await status_msg.edit_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
@@ -246,8 +236,16 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (чистый текст, без Markdown)...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (финальный)...")
+    
+    # Явные таймауты для повышения надёжности при сетевых сбоях
+    application.run_polling(
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 if __name__ == "__main__":
     main()
