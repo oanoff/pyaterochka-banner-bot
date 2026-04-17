@@ -179,7 +179,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
-    # Отправляем промежуточное сообщение
+    # Единое сообщение, которое будет обновляться
     status_msg = await update.message.reply_text(
         f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
     )
@@ -192,21 +192,14 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         )
         return
 
-    # Удаляем промежуточное сообщение
-    await status_msg.delete()
-
-    # Отправляем новое сообщение с процессом анализа
-    analyzing_msg = await update.message.reply_text(
+    await status_msg.edit_text(
         f"{size_msg}\n📝 Распознанный текст:\n{ocr_text[:200]}...\n\n🤖 Анализирую с помощью YandexGPT..."
     )
 
     gpt_result = analyze_text_with_yandexgpt(ocr_text)
 
-    # Удаляем сообщение анализа
-    await analyzing_msg.delete()
-
     if gpt_result is None:
-        await update.message.reply_text(
+        await status_msg.edit_text(
             f"{size_msg}\n❌ Ошибка при обращении к YandexGPT. Проверьте настройки."
         )
         return
@@ -231,8 +224,8 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         lines.append(f"\n*Рекомендация:* {recommendations}")
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
-    # Отправляем финальный результат отдельным сообщением
-    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+    # Редактируем то же сообщение с финальным результатом
+    await status_msg.edit_text("\n".join(lines), parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
@@ -245,7 +238,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (отдельные сообщения)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (надёжное редактирование)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
