@@ -21,7 +21,7 @@ if not BOT_TOKEN:
     raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
 
 # Настройки Yandex Cloud
-FOLDER_ID = "ajeesnnfjttiol4miepk"
+FOLDER_ID = "b1g6irlklro22jcs1i2c"
 API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"
 VISION_OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 YANDEXGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
