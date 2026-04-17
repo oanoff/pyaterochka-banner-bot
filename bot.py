@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-#                         ВСТАВЬТЕ СВОИ ДАННЫЕ СЮДА (уже вставлены)
+#                         ВАШИ ДАННЫЕ (УЖЕ ВСТАВЛЕНЫ)
 # ==============================================================================
 FOLDER_ID = "b1g6irlklro22jcs1i2c"
 API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"
@@ -197,6 +197,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
+    # Отправляем промежуточное сообщение и сразу получаем объект для возможного обновления
     status_msg = await update.message.reply_text(
         f"{size_msg}\n🤖 Распознаю текст (с fallback-стратегией)..."
     )
@@ -209,6 +210,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         )
         return
 
+    # Обновляем статус
     await status_msg.edit_text(
         f"{size_msg}\n📝 Распознанный текст:\n{ocr_text[:200]}...\n\n🤖 Анализирую с помощью YandexGPT..."
     )
@@ -241,7 +243,8 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         lines.append(f"\n*Рекомендация:* {recommendations}")
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
-    await status_msg.edit_text("\n".join(lines), parse_mode='Markdown')
+    # Вместо редактирования отправляем новое сообщение с результатом
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
@@ -254,7 +257,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (fallback OCR)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (новое сообщение + fallback)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
