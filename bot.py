@@ -22,84 +22,50 @@ FOLDER_ID = "b1g6irlklro22jcs1i2c"     # <-- ВАШ FOLDER ID
 API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"                   # <-- ВАШ API-КЛЮЧ
 # ==============================================================================
 
-# Токен бота берётся из переменной окружения (уже задан в Bothost)
+# Токен бота из переменной окружения (уже задан в Bothost)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
 
-# Правильные эндпоинты
-OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"  # Для распознавания текста[reference:2]
-GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion" # Для текстовой модели[reference:3]
-
-# --- ИСПРАВЛЕННЫЙ modelUri для YandexGPT ---
-MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt/latest" # Правильный формат URI для текстовой модели[reference:4]
+# Эндпоинт для YandexGPT (единый для текстовых и мультимодальных моделей)
+YANDEXGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+# Правильный modelUri для мультимодальной модели YandexGPT
+VISION_MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt/vision"
 
 TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
 MAX_FILE_SIZE_MB = 5
 
-# ---------- ФУНКЦИЯ РАСПОЗНАВАНИЯ ТЕКСТА (Yandex OCR) ----------
-def ocr_with_yandex(pil_image: Image.Image) -> str:
+# ---------- ФУНКЦИЯ АНАЛИЗА БАННЕРА ЧЕРЕЗ YANDEXGPT VISION ----------
+def analyze_banner_with_vision(pil_image: Image.Image) -> dict | None:
     """
-    Отправляет изображение в Yandex Vision OCR без какой-либо предобработки,
-    которая могла исказить картинку.
+    Отправляет изображение в мультимодальную модель YandexGPT и возвращает вердикт.
     """
-    auth_header = f"Api-Key {API_KEY}"
+    # Кодируем изображение в base64
+    buffered = io.BytesIO()
+    pil_image.save(buffered, format="JPEG", quality=90)
+    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    # Сохраняем оригинальное изображение в JPEG, немного сжимая для уменьшения размера
-    img_byte_arr = io.BytesIO()
-    pil_image.save(img_byte_arr, format='JPEG', quality=85)
-
-    # Проверяем, что размер файла не превышает 1 МБ (ограничение Vision API)[reference:5]
-    file_size_mb = len(img_byte_arr.getvalue()) / (1024 * 1024)
-    if file_size_mb > 1.0:
-        logger.warning(f"Размер файла {file_size_mb:.2f} МБ превышает 1 МБ. Уменьшаем качество.")
-        img_byte_arr = io.BytesIO()
-        pil_image.save(img_byte_arr, format='JPEG', quality=50) # Уменьшаем качество
-
-    encoded_image = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-
-    body = {
-        "mimeType": "image/jpeg",
-        "languageCodes": ["ru", "en"],
-        "content": encoded_image
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": auth_header,
-        "x-folder-id": FOLDER_ID,
-        "x-data-logging-enabled": "false"
-    }
-
-    try:
-        logger.info("Отправка изображения в Yandex Vision OCR...")
-        response = requests.post(OCR_URL, json=body, headers=headers, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        full_text = data.get("textAnnotation", {}).get("fullText", "")
-        if not full_text:
-            logger.warning("OCR не нашел текст.")
-        return full_text
-    except Exception as e:
-        logger.error(f"Yandex Vision OCR error: {e}")
-        return ""
-
-# ---------- ФУНКЦИЯ АНАЛИЗА ТЕКСТА (YandexGPT) ----------
-def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
-    if not ocr_text:
-        return {"verdict": "error", "issues": ["Текст не обнаружен."], "recommendations": ""}
-
+    # Системный промпт с полными гайдлайнами
     system_prompt = """
-Ты — ассистент по проверке баннеров для приложения Пятёрочки.
-Проанализируй предоставленный текст и проверь его на соответствие следующим гайдлайнам:
+Ты — эксперт по проверке баннеров для приложения Пятёрочки.
+Проанализируй предоставленное изображение баннера и проверь его на соответствие следующим гайдлайнам:
 
-1. Обращение к пользователю на "Вы".
-2. Конкретное предложение с очевидной пользой, без абстрактных слов (например, "Живите оранжево!").
-3. Использование буквы "ё" (например, "ещё", а не "еще").
-4. Кавычки-ёлочки «».
-5. Отсутствие капса (например, "РОЗЫГРЫШ" — ошибка).
-6. Не более одного восклицательного знака.
+1. Размер: должен быть ровно 984x570 пикселей.
+2. Текстовый блок: должен занимать не более 52% площади баннера.
+3. Цвет текста: только #302E33 (на светлом фоне) или #FFFFFF (на тёмном фоне).
+4. Фон: не должен быть чёрным, белым, кислотным, пастельным или текстурным.
+5. Логотип Пятёрочки: запрещён на баннере.
+6. Текстовые правила:
+   - Обращение к пользователю на "Вы".
+   - Конкретное предложение с очевидной пользой, без абстрактных слов.
+   - Использование буквы "ё".
+   - Кавычки-ёлочки «».
+   - Отсутствие капса.
+   - Не более одного восклицательного знака.
+   - Для XS/S баннеров: до 45 символов.
+   - Для M/L баннеров: заголовок до 30 символов, подзаголовок до 55 символов.
+7. Имидж: не должен содержать оружия, мрачных образов, антропоморфизма, стоковых клише.
 
 Верни ответ строго в формате JSON:
 {
@@ -110,15 +76,27 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
 """
 
     payload = {
-        "modelUri": MODEL_URI,
+        "modelUri": VISION_MODEL_URI,
         "completionOptions": {
             "stream": False,
             "temperature": 0.1,
-            "maxTokens": "1000"
+            "maxTokens": "1500"
         },
         "messages": [
-            {"role": "system", "text": system_prompt},
-            {"role": "user", "text": f"Проверь этот текст: {ocr_text}"}
+            {
+                "role": "system",
+                "text": system_prompt
+            },
+            {
+                "role": "user",
+                "text": "Проверь этот баннер по гайдам Пятёрочки.",
+                "attachments": [
+                    {
+                        "content_type": "image/jpeg",
+                        "content": img_base64
+                    }
+                ]
+            }
         ]
     }
 
@@ -129,31 +107,33 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     }
 
     try:
-        logger.info("Отправка текста в YandexGPT...")
-        response = requests.post(GPT_URL, json=payload, headers=headers, timeout=60)
+        logger.info("Отправка изображения в YandexGPT Vision...")
+        response = requests.post(YANDEXGPT_URL, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         result = response.json()
         content = result["result"]["alternatives"][0]["message"]["text"]
+
+        # Парсим JSON из ответа модели
         try:
             start = content.find('{')
             end = content.rfind('}') + 1
             if start != -1 and end > start:
                 return json.loads(content[start:end])
             else:
-                return {"verdict": "error", "issues": ["Не удалось разобрать ответ"], "recommendations": content}
+                return {"verdict": "error", "issues": ["Не удалось разобрать ответ модели"], "recommendations": content}
         except json.JSONDecodeError:
-            return {"verdict": "error", "issues": ["Некорректный JSON"], "recommendations": content}
+            return {"verdict": "error", "issues": ["Некорректный JSON в ответе"], "recommendations": content}
     except Exception as e:
-        logger.error(f"YandexGPT error: {e}")
+        logger.error(f"YandexGPT Vision error: {e}")
         return None
 
-# ---------- ОБРАБОТЧИКИ TELEGRAM (БЕЗ ИЗМЕНЕНИЙ) ----------
+# ---------- ОБРАБОТЧИКИ TELEGRAM ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Я — умный агент проверки баннеров для Пятёрочки (Yandex AI).\n\n"
+        "👋 Я — умный агент проверки баннеров для Пятёрочки (YandexGPT Vision).\n\n"
         "📌 *ВАЖНО:* Отправляйте баннер *как документ (файл)*, "
         "а не как фото. Telegram сжимает фото, искажая размеры.\n\n"
-        "Я проверю баннер по всем гайдлайнам и дам подробный отчёт.",
+        "Я проанализирую изображение с помощью ИИ и дам подробный отчёт.",
         parse_mode='Markdown'
     )
 
@@ -171,7 +151,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not document.mime_type or not document.mime_type.startswith('image/'):
         await update.message.reply_text("❌ Пожалуйста, отправьте изображение.")
         return
-    await update.message.reply_text("🔍 Анализирую оригинальный файл с помощью Yandex AI...")
+    await update.message.reply_text("🔍 Анализирую оригинальный файл с помощью YandexGPT Vision...")
     file = await document.get_file()
     image_bytes = await file.download_as_bytearray()
     await process_image(update, image_bytes, is_compressed=False)
@@ -193,35 +173,25 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
     status_msg = await update.message.reply_text(
-        f"{size_msg}\n🤖 Распознаю текст (без предобработки)..."
+        f"{size_msg}\n🤖 Анализирую изображение с помощью ИИ... (может занять ~15-20 сек)"
     )
 
-    ocr_text = ocr_with_yandex(img_pil)
-    if not ocr_text:
+    # Отправляем изображение напрямую в мультимодальную модель
+    result = analyze_banner_with_vision(img_pil)
+
+    if result is None:
         await status_msg.edit_text(
-            f"{size_msg}\n❌ Не удалось распознать текст. "
-            "Убедитесь, что текст на баннере хорошо читается и не перекрыт другими элементами."
+            f"{size_msg}\n❌ Ошибка при обращении к ИИ. Проверьте настройки или повторите позже."
         )
         return
 
-    await status_msg.edit_text(
-        f"{size_msg}\n📝 Распознанный текст:\n{ocr_text[:200]}...\n\n🤖 Анализирую с помощью YandexGPT..."
-    )
+    verdict = result.get("verdict", "error")
+    issues = result.get("issues", [])
+    recommendations = result.get("recommendations", "")
 
-    gpt_result = analyze_text_with_yandexgpt(ocr_text)
-    if gpt_result is None:
-        await status_msg.edit_text(
-            f"{size_msg}\n❌ Ошибка при обращении к YandexGPT. Проверьте настройки."
-        )
-        return
-
-    verdict = gpt_result.get("verdict", "error")
-    issues = gpt_result.get("issues", [])
-    recommendations = gpt_result.get("recommendations", "")
-
-    final_verdict = "✅ Текст полностью соответствует гайдам!" if verdict == "ok" else "❌ Текст имеет нарушения."
+    final_verdict = "✅ Баннер полностью соответствует гайдам!" if verdict == "ok" else "❌ Баннер имеет нарушения."
     lines = [
-        f"*Результаты проверки (Yandex AI):*",
+        f"*Результаты проверки (YandexGPT Vision):*",
         size_msg,
         f"\n*Вердикт:* {final_verdict}",
     ]
@@ -233,7 +203,6 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
             lines.append(f"• {issue}")
     if recommendations:
         lines.append(f"\n*Рекомендация:* {recommendations}")
-    lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
     await status_msg.edit_text("\n".join(lines), parse_mode='Markdown')
 
@@ -241,14 +210,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
 
 def main():
-    if not BOT_TOKEN:
-        raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (исправленный)...")
+    logger.info("Бот запущен с YandexGPT Vision (прямой анализ изображений)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
