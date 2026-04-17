@@ -22,36 +22,26 @@ FOLDER_ID = "b1g6irlklro22jcs1i2c"     # <-- ВАШ FOLDER ID
 API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"                   # <-- ВАШ API-КЛЮЧ
 # ==============================================================================
 
-# Токен бота из переменной окружения (уже задан в Bothost)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
 
-# Эндпоинты API
 OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
-# Параметры баннеров
 TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
 MAX_FILE_SIZE_MB = 5
 
-# ---------- ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЯ ----------
 def preprocess_image(pil_image: Image.Image) -> Image.Image:
-    """Улучшает изображение для OCR: повышение резкости и контраста."""
-    # Увеличиваем резкость
     enhancer = ImageEnhance.Sharpness(pil_image)
     pil_image = enhancer.enhance(2.0)
-    # Увеличиваем контраст
     enhancer = ImageEnhance.Contrast(pil_image)
     pil_image = enhancer.enhance(1.5)
-    # Лёгкое сглаживание артефактов
     pil_image = pil_image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
     return pil_image
 
-# ---------- ФУНКЦИЯ РАСПОЗНАВАНИЯ ТЕКСТА (Yandex Vision OCR) ----------
 def ocr_with_yandex(pil_image: Image.Image) -> str:
-    # Предобработка
     processed_img = preprocess_image(pil_image)
 
     img_byte_arr = io.BytesIO()
@@ -72,16 +62,18 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
     }
 
     try:
-        logger.info("Отправка изображения в Yandex Vision OCR (с предобработкой)...")
+        logger.info("Отправка изображения в Yandex Vision OCR...")
         response = requests.post(OCR_URL, json=body, headers=headers, timeout=30)
+        logger.info(f"OCR статус ответа: {response.status_code}")
         response.raise_for_status()
         data = response.json()
+        # Логируем полный ответ для диагностики
+        logger.info(f"OCR ответ: {json.dumps(data, indent=2, ensure_ascii=False)}")
         return data.get("textAnnotation", {}).get("fullText", "")
     except Exception as e:
         logger.error(f"Yandex Vision OCR error: {e}")
         return ""
 
-# ---------- ФУНКЦИЯ АНАЛИЗА ТЕКСТА (YandexGPT) ----------
 def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     if not ocr_text:
         return {"verdict": "error", "issues": ["Текст не обнаружен."], "recommendations": ""}
@@ -143,7 +135,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         logger.error(f"YandexGPT error: {e}")
         return None
 
-# ---------- ОБРАБОТЧИКИ TELEGRAM ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Я — умный агент проверки баннеров для Пятёрочки (Yandex AI).\n\n"
@@ -189,14 +180,14 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
     status_msg = await update.message.reply_text(
-        f"{size_msg}\n🤖 Распознаю текст (с улучшенной предобработкой)..."
+        f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
     )
 
     ocr_text = ocr_with_yandex(img_pil)
     if not ocr_text:
         await status_msg.edit_text(
             f"{size_msg}\n❌ Не удалось распознать текст. "
-            "Убедитесь, что текст на баннере хорошо читается и не перекрыт другими элементами."
+            "Убедитесь, что текст на баннере хорошо читается."
         )
         return
 
@@ -244,7 +235,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (с предобработкой изображений)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (расширенное логирование)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
