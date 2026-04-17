@@ -5,6 +5,8 @@ import base64
 import logging
 import requests
 from PIL import Image
+import cv2
+import numpy as np
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -18,10 +20,14 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 #                         ВСТАВЬТЕ СВОИ ДАННЫЕ СЮДА
 # =============================================================================
-BOT_TOKEN = "8724696882:AAEoyom_jV66fBtRP472yIUfDCYDGaNuPX8"       # <-- ВАШ ТОКЕН
 FOLDER_ID = "b1g6irlklro22jcs1i2c"     # <-- ВАШ FOLDER ID
 API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"                   # <-- ВАШ API-КЛЮЧ
 # =============================================================================
+
+# Токен бота берётся из переменной окружения (уже задан в Bothost)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
 
 VISION_OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 YANDEXGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
@@ -30,13 +36,46 @@ TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
 MAX_FILE_SIZE_MB = 5
 
-# ---------- ФУНКЦИЯ РАСПОЗНАВАНИЯ ТЕКСТА (с несколькими моделями) ----------
+# ---------- ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЯ ДЛЯ OCR ----------
+def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
+    """
+    Увеличивает изображение, повышает контраст и подготавливает для OCR.
+    """
+    # Увеличиваем в 2 раза
+    w, h = pil_image.size
+    pil_image = pil_image.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
+
+    # Конвертируем в оттенки серого
+    gray = pil_image.convert('L')
+
+    # Применяем CLAHE (локальное выравнивание гистограммы) через OpenCV
+    img_cv = np.array(gray)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast = clahe.apply(img_cv)
+
+    # Лёгкая бинаризация (адаптивный порог)
+    binary = cv2.adaptiveThreshold(
+        contrast, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11, 2
+    )
+
+    # Обратно в PIL
+    return Image.fromarray(binary)
+
+# ---------- ФУНКЦИЯ РАСПОЗНАВАНИЯ ТЕКСТА ----------
 def ocr_with_yandex_vision(pil_image: Image.Image) -> str:
-    """Пробует разные модели OCR, чтобы найти текст."""
+    """
+    Отправляет изображение в Yandex Vision OCR с предобработкой.
+    """
     auth_header = f"Api-Key {API_KEY}"
 
+    # Предобработка
+    processed_img = preprocess_for_ocr(pil_image)
+
     img_byte_arr = io.BytesIO()
-    pil_image.save(img_byte_arr, format='JPEG', quality=95)
+    processed_img.save(img_byte_arr, format='JPEG', quality=100)
     encoded_image = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     headers = {
@@ -46,7 +85,7 @@ def ocr_with_yandex_vision(pil_image: Image.Image) -> str:
         "x-data-logging-enabled": "false"
     }
 
-    models_to_try = ["page", "handwritten", None]  # None означает без указания model
+    models_to_try = ["page", "handwritten", None]
 
     for model in models_to_try:
         body = {
@@ -64,14 +103,12 @@ def ocr_with_yandex_vision(pil_image: Image.Image) -> str:
             data = response.json()
             full_text = data.get("textAnnotation", {}).get("fullText", "")
             if full_text.strip():
-                logger.info(f"Успешно с моделью {model if model else 'авто'}: {full_text[:100]}...")
+                logger.info(f"Успешно: {full_text[:100]}...")
                 return full_text
             else:
                 logger.warning(f"Модель {model if model else 'авто'} не нашла текст.")
         except Exception as e:
             logger.error(f"Ошибка с моделью {model if model else 'авто'}: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Ответ сервера: {e.response.text}")
 
     logger.error("Все попытки OCR не дали результата.")
     return ""
@@ -125,7 +162,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         response.raise_for_status()
         result = response.json()
         content = result["result"]["alternatives"][0]["message"]["text"]
-        # Парсим JSON
         try:
             start = content.find('{')
             end = content.rfind('}') + 1
@@ -139,7 +175,7 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         logger.error(f"YandexGPT error: {e}")
         return None
 
-# ---------- ОБРАБОТЧИКИ TELEGRAM (без изменений) ----------
+# ---------- ОБРАБОТЧИКИ TELEGRAM ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Я — умный агент проверки баннеров для Пятёрочки (Yandex AI).\n\n"
@@ -185,13 +221,14 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
     status_msg = await update.message.reply_text(
-        f"{size_msg}\n🤖 Распознаю текст с помощью Yandex Vision..."
+        f"{size_msg}\n🤖 Распознаю текст (с улучшенной предобработкой)..."
     )
 
     ocr_text = ocr_with_yandex_vision(img_pil)
     if not ocr_text:
         await status_msg.edit_text(
-            f"{size_msg}\n❌ Не удалось распознать текст. Проверьте, есть ли текст на баннере."
+            f"{size_msg}\n❌ Не удалось распознать текст даже после предобработки. "
+            "Убедитесь, что текст на баннере хорошо читается и контрастен."
         )
         return
 
@@ -232,14 +269,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
 
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "ВСТАВЬТЕ_ТОКЕН_БОТА":
-        raise ValueError("Токен бота не задан!")
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (улучшенный OCR)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (предобработка изображений)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
