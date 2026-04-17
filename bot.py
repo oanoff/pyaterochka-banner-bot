@@ -16,10 +16,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-#                         ВСТАВЬТЕ СВОИ ДАННЫЕ СЮДА
+#                         ВСТАВЬТЕ СВОИ ДАННЫЕ СЮДА (уже вставлены)
 # ==============================================================================
-FOLDER_ID = "b1g6irlklro22jcs1i2c"     # <-- ВАШ FOLDER ID
-API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"                   # <-- ВАШ API-КЛЮЧ
+FOLDER_ID = "b1g6irlklro22jcs1i2c"
+API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"
 # ==============================================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -41,11 +41,10 @@ def preprocess_image(pil_image: Image.Image) -> Image.Image:
     pil_image = pil_image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
     return pil_image
 
-def ocr_with_yandex(pil_image: Image.Image) -> str:
-    processed_img = preprocess_image(pil_image)
-
+def call_ocr_api(pil_image: Image.Image) -> str:
+    """Отправляет изображение в Yandex Vision OCR и возвращает fullText."""
     img_byte_arr = io.BytesIO()
-    processed_img.save(img_byte_arr, format='JPEG', quality=95)
+    pil_image.save(img_byte_arr, format='JPEG', quality=95)
     encoded_image = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     body = {
@@ -62,16 +61,35 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
     }
 
     try:
-        logger.info("Отправка изображения в Yandex Vision OCR...")
         response = requests.post(OCR_URL, json=body, headers=headers, timeout=30)
-        logger.info(f"OCR статус ответа: {response.status_code}")
         response.raise_for_status()
         data = response.json()
-        logger.info(f"OCR ответ: {json.dumps(data, indent=2, ensure_ascii=False)}")
         return data.get("textAnnotation", {}).get("fullText", "")
     except Exception as e:
-        logger.error(f"Yandex Vision OCR error: {e}")
+        logger.error(f"OCR API error: {e}")
         return ""
+
+def ocr_with_yandex(pil_image: Image.Image) -> str:
+    """
+    Пытается распознать текст: сначала с предобработкой, затем без.
+    """
+    # Попытка 1: с предобработкой
+    logger.info("Попытка OCR с предобработкой...")
+    processed = preprocess_image(pil_image)
+    text = call_ocr_api(processed)
+    if text.strip():
+        logger.info("OCR успешен с предобработкой.")
+        return text
+
+    # Попытка 2: без предобработки (оригинал)
+    logger.warning("Предобработка не дала текста. Пробую оригинальное изображение...")
+    text = call_ocr_api(pil_image)
+    if text.strip():
+        logger.info("OCR успешен с оригиналом.")
+        return text
+
+    logger.error("OCR не нашёл текст ни с предобработкой, ни с оригиналом.")
+    return ""
 
 def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     if not ocr_text:
@@ -179,9 +197,8 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
-    # Единое сообщение, которое будет обновляться
     status_msg = await update.message.reply_text(
-        f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
+        f"{size_msg}\n🤖 Распознаю текст (с fallback-стратегией)..."
     )
 
     ocr_text = ocr_with_yandex(img_pil)
@@ -224,7 +241,6 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         lines.append(f"\n*Рекомендация:* {recommendations}")
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
-    # Редактируем то же сообщение с финальным результатом
     await status_msg.edit_text("\n".join(lines), parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,7 +254,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (надёжное редактирование)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (fallback OCR)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
