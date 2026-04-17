@@ -67,7 +67,6 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
         logger.info(f"OCR статус ответа: {response.status_code}")
         response.raise_for_status()
         data = response.json()
-        # Логируем полный ответ для диагностики
         logger.info(f"OCR ответ: {json.dumps(data, indent=2, ensure_ascii=False)}")
         return data.get("textAnnotation", {}).get("fullText", "")
     except Exception as e:
@@ -122,6 +121,7 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         response.raise_for_status()
         result = response.json()
         content = result["result"]["alternatives"][0]["message"]["text"]
+        logger.info(f"YandexGPT ответ: {content}")
         try:
             start = content.find('{')
             end = content.rfind('}') + 1
@@ -179,6 +179,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
+    # Отправляем промежуточное сообщение
     status_msg = await update.message.reply_text(
         f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
     )
@@ -191,13 +192,21 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         )
         return
 
-    await status_msg.edit_text(
+    # Удаляем промежуточное сообщение
+    await status_msg.delete()
+
+    # Отправляем новое сообщение с процессом анализа
+    analyzing_msg = await update.message.reply_text(
         f"{size_msg}\n📝 Распознанный текст:\n{ocr_text[:200]}...\n\n🤖 Анализирую с помощью YandexGPT..."
     )
 
     gpt_result = analyze_text_with_yandexgpt(ocr_text)
+
+    # Удаляем сообщение анализа
+    await analyzing_msg.delete()
+
     if gpt_result is None:
-        await status_msg.edit_text(
+        await update.message.reply_text(
             f"{size_msg}\n❌ Ошибка при обращении к YandexGPT. Проверьте настройки."
         )
         return
@@ -222,7 +231,8 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         lines.append(f"\n*Рекомендация:* {recommendations}")
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
-    await status_msg.edit_text("\n".join(lines), parse_mode='Markdown')
+    # Отправляем финальный результат отдельным сообщением
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}")
@@ -235,7 +245,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (расширенное логирование)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (отдельные сообщения)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
