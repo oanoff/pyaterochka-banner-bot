@@ -4,7 +4,7 @@ import json
 import base64
 import logging
 import requests
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -22,7 +22,7 @@ FOLDER_ID = "b1g6irlklro22jcs1i2c"     # <-- ВАШ FOLDER ID
 API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"                   # <-- ВАШ API-КЛЮЧ
 # ==============================================================================
 
-# Токен бота берётся из переменной окружения (уже задан в Bothost)
+# Токен бота из переменной окружения (уже задан в Bothost)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
@@ -36,13 +36,26 @@ TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
 MAX_FILE_SIZE_MB = 5
 
+# ---------- ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЯ ----------
+def preprocess_image(pil_image: Image.Image) -> Image.Image:
+    """Улучшает изображение для OCR: повышение резкости и контраста."""
+    # Увеличиваем резкость
+    enhancer = ImageEnhance.Sharpness(pil_image)
+    pil_image = enhancer.enhance(2.0)
+    # Увеличиваем контраст
+    enhancer = ImageEnhance.Contrast(pil_image)
+    pil_image = enhancer.enhance(1.5)
+    # Лёгкое сглаживание артефактов
+    pil_image = pil_image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    return pil_image
+
 # ---------- ФУНКЦИЯ РАСПОЗНАВАНИЯ ТЕКСТА (Yandex Vision OCR) ----------
 def ocr_with_yandex(pil_image: Image.Image) -> str:
-    auth_header = f"Api-Key {API_KEY}"
+    # Предобработка
+    processed_img = preprocess_image(pil_image)
 
-    # Сохраняем изображение в JPEG с небольшим сжатием
     img_byte_arr = io.BytesIO()
-    pil_image.save(img_byte_arr, format='JPEG', quality=85)
+    processed_img.save(img_byte_arr, format='JPEG', quality=95)
     encoded_image = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
 
     body = {
@@ -53,13 +66,13 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": auth_header,
+        "Authorization": f"Api-Key {API_KEY}",
         "x-folder-id": FOLDER_ID,
         "x-data-logging-enabled": "false"
     }
 
     try:
-        logger.info("Отправка изображения в Yandex Vision OCR...")
+        logger.info("Отправка изображения в Yandex Vision OCR (с предобработкой)...")
         response = requests.post(OCR_URL, json=body, headers=headers, timeout=30)
         response.raise_for_status()
         data = response.json()
@@ -176,7 +189,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
     status_msg = await update.message.reply_text(
-        f"{size_msg}\n🤖 Распознаю текст..."
+        f"{size_msg}\n🤖 Распознаю текст (с улучшенной предобработкой)..."
     )
 
     ocr_text = ocr_with_yandex(img_pil)
@@ -231,7 +244,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (стабильная версия)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (с предобработкой изображений)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
