@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-#                         ВАШИ ДАННЫЕ (УЖЕ ВСТАВЛЕНЫ)
+#                         ДАННЫЕ ДЛЯ YANDEX CLOUD
 # ==============================================================================
 FOLDER_ID = "b1g6irlklro22jcs1i2c"
 API_KEY = "AQVNzuXu-feyxUlpOzTXEAL1U7lB_h7lwDjhh4kQ"
@@ -26,20 +26,23 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
 
+# --- Эндпоинты Yandex Cloud ---
 OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt-lite/latest"
+VISION_CLASSIFY_URL = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
 
+# --- Параметры ---
+MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt-lite/latest"
 TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
 MAX_FILE_SIZE_MB = 5
-
-# Лимиты символов
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
 MAX_CHARS_SUBTITLE_M_L = 55
+SAFETY_THRESHOLD = 0.7  # Порог для определения "небезопасного" контента
 
 def preprocess_image(pil_image: Image.Image) -> Image.Image:
+    """Предобработка изображения для улучшения распознавания текста."""
     enhancer = ImageEnhance.Sharpness(pil_image)
     pil_image = enhancer.enhance(2.0)
     enhancer = ImageEnhance.Contrast(pil_image)
@@ -47,7 +50,61 @@ def preprocess_image(pil_image: Image.Image) -> Image.Image:
     pil_image = pil_image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
     return pil_image
 
+def check_image_safety(pil_image: Image.Image) -> tuple[bool, str]:
+    """
+    Проверяет изображение с помощью Yandex Vision Classification (модель 'moderation').
+    Возвращает (True, "") если безопасно, иначе (False, "причина").
+    """
+    try:
+        img_byte_arr = io.BytesIO()
+        pil_image.save(img_byte_arr, format='JPEG', quality=85)
+        encoded_image = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+
+        body = {
+            "folderId": FOLDER_ID,
+            "analyze_specs": [{
+                "content": encoded_image,
+                "features": [{
+                    "type": "CLASSIFICATION",
+                    "classificationConfig": {
+                        "model": "moderation"
+                    }
+                }]
+            }]
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Api-Key {API_KEY}"
+        }
+
+        logger.info("Проверка изображения на безопасность...")
+        response = requests.post(VISION_CLASSIFY_URL, json=body, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        # Извлекаем результаты классификации
+        results = data.get("results", [])
+        if not results:
+            return True, ""
+        
+        properties = results[0].get("results", [{}])[0].get("classification", {}).get("properties", [])
+        
+        # Ищем проблемные категории с высокой вероятностью
+        for prop in properties:
+            if prop.get("probability", 0) > SAFETY_THRESHOLD:
+                category = prop.get("name", "").lower()
+                if "adult" in category or "shocking" in category or "violence" in category:
+                    return False, f"обнаружен нежелательный контент ({category})"
+        
+        return True, ""
+
+    except Exception as e:
+        logger.error(f"Ошибка при проверке безопасности изображения: {e}")
+        return True, ""  # В случае ошибки не блокируем
+
 def ocr_with_yandex(pil_image: Image.Image) -> str:
+    """Отправляет изображение в Yandex Vision OCR и возвращает распознанный текст."""
     processed_img = preprocess_image(pil_image)
 
     img_byte_arr = io.BytesIO()
@@ -70,7 +127,6 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
     try:
         logger.info("Отправка изображения в Yandex Vision OCR...")
         response = requests.post(OCR_URL, json=body, headers=headers, timeout=30)
-        logger.info(f"OCR статус ответа: {response.status_code}")
         response.raise_for_status()
         data = response.json()
         text = data.get("result", {}).get("textAnnotation", {}).get("fullText", "")
@@ -81,6 +137,7 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
         return ""
 
 def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
+    """Анализирует текст с помощью YandexGPT."""
     if not ocr_text:
         return {"verdict": "error", "issues": ["Текст не обнаружен."], "recommendations": ""}
 
@@ -145,7 +202,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     try:
         logger.info("Отправка текста в YandexGPT...")
         response = requests.post(GPT_URL, json=payload, headers=headers, timeout=60)
-        logger.info(f"YandexGPT статус ответа: {response.status_code}")
         response.raise_for_status()
         result = response.json()
         content = result["result"]["alternatives"][0]["message"]["text"]
@@ -261,6 +317,20 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
+    # 1. Проверяем безопасность изображения
+    is_safe, safety_reason = check_image_safety(img_pil)
+    if not is_safe:
+        lines = [
+            f"*Результаты проверки (Yandex AI):*",
+            size_msg,
+            f"\n*Вердикт:* ❌ Баннер имеет нарушения.",
+            f"\n*Обнаруженные проблемы:*",
+            f"• {safety_reason}",
+            f"\n*Рекомендация:* Замените изображение.",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+        return
+
     await update.message.reply_text(
         f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
     )
@@ -303,6 +373,10 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
             lines.append(f"• {issue}")
     if recommendations:
         lines.append(f"\n*Рекомендация:* {recommendations}")
+
+    # Добавляем предупреждение о ручной проверке имиджа (стилистические запреты)
+    lines.append("\n⚠️ *Требуется ручная проверка:* убедитесь, что изображение не содержит оружия, мрачных готических образов или антропоморфизма.")
+
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
@@ -318,7 +392,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (полная постобработка)...")
+    logger.info("Бот запущен с Yandex Vision OCR + Classification + YandexGPT...")
     
     application.run_polling(
         read_timeout=30,
