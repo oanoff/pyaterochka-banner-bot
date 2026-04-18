@@ -67,16 +67,31 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
         logger.info(f"OCR статус ответа: {response.status_code}")
         response.raise_for_status()
         data = response.json()
-        logger.info(f"OCR ответ: {json.dumps(data, indent=2, ensure_ascii=False)}")
+        logger.info(f"OCR ответ (ключи верхнего уровня): {list(data.keys())}")
         
-        # ИСПРАВЛЕНО: правильный путь к fullText в новом API
-        results = data.get("results", [])
-        if results:
-            text_annotation = results[0].get("textAnnotation", {})
-            full_text = text_annotation.get("fullText", "")
-            logger.info(f"Извлечённый текст: {full_text}")
-            return full_text
-        return ""
+        # Пытаемся извлечь текст из разных возможных мест
+        text = ""
+        if "result" in data:
+            # Старый формат
+            text = data.get("result", {}).get("textAnnotation", {}).get("fullText", "")
+            logger.info(f"Извлечение из result.textAnnotation.fullText: {text[:100] if text else 'пусто'}")
+        elif "results" in data:
+            # Новый формат (массив)
+            results = data.get("results", [])
+            if results:
+                text_annotation = results[0].get("textAnnotation", {})
+                text = text_annotation.get("fullText", "")
+                logger.info(f"Извлечение из results[0].textAnnotation.fullText: {text[:100] if text else 'пусто'}")
+        elif "textAnnotation" in data:
+            # Плоский формат
+            text = data.get("textAnnotation", {}).get("fullText", "")
+            logger.info(f"Извлечение из textAnnotation.fullText: {text[:100] if text else 'пусто'}")
+        else:
+            logger.error(f"Неизвестная структура ответа OCR: {json.dumps(data, indent=2, ensure_ascii=False)[:500]}")
+        
+        if not text:
+            logger.warning("Текст не найден ни в одном известном поле.")
+        return text
     except Exception as e:
         logger.error(f"Yandex Vision OCR error: {e}")
         return ""
@@ -244,7 +259,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (исправлено извлечение текста)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (гибкое извлечение текста)...")
     
     application.run_polling(
         read_timeout=30,
