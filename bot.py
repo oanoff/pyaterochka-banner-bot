@@ -68,7 +68,15 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
         response.raise_for_status()
         data = response.json()
         logger.info(f"OCR ответ: {json.dumps(data, indent=2, ensure_ascii=False)}")
-        return data.get("textAnnotation", {}).get("fullText", "")
+        
+        # ИСПРАВЛЕНО: правильный путь к fullText в новом API
+        results = data.get("results", [])
+        if results:
+            text_annotation = results[0].get("textAnnotation", {})
+            full_text = text_annotation.get("fullText", "")
+            logger.info(f"Извлечённый текст: {full_text}")
+            return full_text
+        return ""
     except Exception as e:
         logger.error(f"Yandex Vision OCR error: {e}")
         return ""
@@ -179,7 +187,6 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
-    # Сообщение о начале распознавания (новое, не редактируемое)
     await update.message.reply_text(
         f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
     )
@@ -192,7 +199,6 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         )
         return
 
-    # Сообщение о переходе к анализу (новое)
     await update.message.reply_text(
         f"{size_msg}\n📝 Распознанный текст:\n{ocr_text[:200]}...\n\n🤖 Анализирую с помощью YandexGPT..."
     )
@@ -225,7 +231,6 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         lines.append(f"\n*Рекомендация:* {recommendations}")
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
-    # Финальный результат — отдельное сообщение
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,7 +244,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (только новые сообщения)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (исправлено извлечение текста)...")
     
     application.run_polling(
         read_timeout=30,
