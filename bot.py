@@ -34,6 +34,11 @@ TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
 MAX_FILE_SIZE_MB = 5
 
+# Лимиты символов
+MAX_CHARS_XS_S = 45
+MAX_CHARS_TITLE_M_L = 30
+MAX_CHARS_SUBTITLE_M_L = 55
+
 def preprocess_image(pil_image: Image.Image) -> Image.Image:
     enhancer = ImageEnhance.Sharpness(pil_image)
     pil_image = enhancer.enhance(2.0)
@@ -79,37 +84,55 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     if not ocr_text:
         return {"verdict": "error", "issues": ["Текст не обнаружен."], "recommendations": ""}
 
-    # Улучшенный промпт с чёткими правилами и примерами
-    system_prompt = """
-Ты — эксперт по проверке текстов для баннеров Пятёрочки. Твоя задача — найти ТОЛЬКО реальные нарушения в предоставленном тексте. Не придумывай ошибок, если их нет. Анализируй строго по следующим правилам:
+    # Подсчитываем символы для проверки лимитов
+    char_count = len(ocr_text.strip())
+    lines = ocr_text.strip().split('\n')
+    title = lines[0] if lines else ''
+    subtitle = ' '.join(lines[1:]) if len(lines) > 1 else ''
+    title_chars = len(title)
+    subtitle_chars = len(subtitle)
 
-1. Обращение к пользователю на "Вы". Нарушение: обращение на "ты" ("получи", "купи").
-2. Конкретное предложение с очевидной пользой, без абстрактных слов. Нарушение: фразы вроде "Живите оранжево!", "Больше орехов, больше призов!".
-3. Использование буквы "ё". Нарушение: "еще" вместо "ещё", "пятерочка" вместо "пятёрочка".
-4. Кавычки-ёлочки «». Нарушение: использование "прямых" или “английских” кавычек.
-5. Отсутствие капса. Нарушение: КОГДА ВЕСЬ ТЕКСТ ИЛИ ЗАГОЛОВОК НАБРАН ЗАГЛАВНЫМИ БУКВАМИ. Отдельные заглавные буквы в начале слов и аббревиатуры (например, "VIP") НЕ ЯВЛЯЮТСЯ нарушением.
-6. Не более одного восклицательного знака на весь текст. Нарушение: два и более "!" в любом месте.
+    # Определяем тип баннера по количеству символов
+    if char_count <= MAX_CHARS_XS_S + 10:
+        banner_type = 'xs_s'
+        char_limit_msg = f"Общее количество символов: {char_count} (макс. {MAX_CHARS_XS_S} для XS/S)"
+    else:
+        banner_type = 'm_l'
+        char_limit_msg = f"Заголовок: {title_chars} симв. (макс. {MAX_CHARS_TITLE_M_L}), подзаголовок: {subtitle_chars} симв. (макс. {MAX_CHARS_SUBTITLE_M_L})"
 
-ВАЖНО: Если восклицательный знак один — это НЕ нарушение. Если капс отсутствует — это НЕ нарушение.
+    system_prompt = f"""
+Ты — эксперт по проверке баннеров для приложения Пятёрочки.
+Проанализируй предоставленный текст и проверь его на соответствие гайдлайнам. Твоя задача — найти ТОЛЬКО реальные нарушения. Не придумывай ошибок.
 
-Верни ответ строго в формате JSON без дополнительного текста:
-{
+ГАЙДЛАЙНЫ:
+1. **Обращение к пользователю**: должно быть на "Вы" (получите, купите). Нарушение: "получи", "купи" (обращение на "ты").
+2. **Конкретное предложение**: должно описывать выгоду без абстрактных слов. Нарушение: фразы вроде "Живите оранжево!", "Больше орехов, больше призов!".
+3. **Буква "ё"**: обязательно использовать "ё" в словах, где она нужна. Нарушение: "еще" вместо "ещё", "пятерочка" вместо "пятёрочка".
+4. **Кавычки**: только «ёлочки». Нарушение: "прямые" или “английские” кавычки.
+5. **Капс (ЗАГЛАВНЫЕ БУКВЫ)**: запрещён. Нарушение: когда весь текст или целый заголовок написан капсом. Отдельные заглавные буквы в начале предложений и аббревиатуры (VIP, X5) — НЕ нарушение.
+6. **Восклицательные знаки**: не более одного на ВЕСЬ текст. Нарушение: два и более "!". Один "!" — НЕ нарушение.
+
+{banner_type.upper()} БАННЕР: {char_limit_msg}
+(Лимиты символов уже проверены автоматически, НЕ включай их в список нарушений).
+
+Верни ответ строго в формате JSON:
+{{
   "verdict": "ok" или "error",
-  "issues": ["список", "конкретных", "нарушений"],
-  "recommendations": "краткая рекомендация по исправлению (если есть нарушения)"
-}
+  "issues": ["конкретное нарушение 1", "конкретное нарушение 2"],
+  "recommendations": "что исправить (только если есть нарушения)"
+}}
 """
 
     payload = {
         "modelUri": MODEL_URI,
         "completionOptions": {
             "stream": False,
-            "temperature": 0.0,  # нулевая температура для максимальной точности
+            "temperature": 0.0,
             "maxTokens": 1000
         },
         "messages": [
             {"role": "system", "text": system_prompt},
-            {"role": "user", "text": f"Проверь этот текст:\n{ocr_text}"}
+            {"role": "user", "text": f"Проверь текст:\n{ocr_text}"}
         ]
     }
 
@@ -120,22 +143,76 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     }
 
     try:
-        logger.info(f"Отправка текста в YandexGPT...")
+        logger.info("Отправка текста в YandexGPT...")
         response = requests.post(GPT_URL, json=payload, headers=headers, timeout=60)
         logger.info(f"YandexGPT статус ответа: {response.status_code}")
         response.raise_for_status()
         result = response.json()
         content = result["result"]["alternatives"][0]["message"]["text"]
         logger.info(f"YandexGPT ответ: {content[:200]}...")
+
+        # Парсим JSON
         try:
             start = content.find('{')
             end = content.rfind('}') + 1
             if start != -1 and end > start:
-                return json.loads(content[start:end])
+                gpt_result = json.loads(content[start:end])
             else:
                 return {"verdict": "error", "issues": ["Не удалось разобрать ответ модели"], "recommendations": content}
         except json.JSONDecodeError:
             return {"verdict": "error", "issues": ["Некорректный JSON в ответе"], "recommendations": content}
+
+        # --- ПОСТОБРАБОТКА: исправляем ошибки модели ---
+        issues = gpt_result.get("issues", [])
+        corrected_issues = []
+
+        # 1. Проверка восклицательных знаков
+        exclamation_count = ocr_text.count('!')
+        if exclamation_count <= 1:
+            for issue in issues:
+                if 'восклицательных' not in issue.lower() and 'знак' not in issue.lower():
+                    corrected_issues.append(issue)
+            if len(corrected_issues) < len(issues):
+                logger.info("Исправлено: удалено ложное нарушение о восклицательных знаках")
+        else:
+            corrected_issues = issues
+
+        # 2. Проверка капса (если модель ошибочно его указала)
+        final_issues = []
+        for issue in corrected_issues:
+            if 'капс' in issue.lower() or 'заглавн' in issue.lower():
+                # Проверяем, действительно ли есть капс (весь текст заглавными или целая строка)
+                has_caps = False
+                for line in ocr_text.split('\n'):
+                    if line and line == line.upper() and len(line.strip()) > 3:
+                        has_caps = True
+                        break
+                if has_caps:
+                    final_issues.append(issue)
+                else:
+                    logger.info("Исправлено: удалено ложное нарушение о капсе")
+            else:
+                final_issues.append(issue)
+
+        # 3. Проверка лимитов символов
+        if banner_type == 'xs_s' and char_count > MAX_CHARS_XS_S:
+            final_issues.append(f"Превышен лимит символов: {char_count} (макс. {MAX_CHARS_XS_S})")
+        elif banner_type == 'm_l':
+            if title_chars > MAX_CHARS_TITLE_M_L:
+                final_issues.append(f"Заголовок превышает {MAX_CHARS_TITLE_M_L} символов (сейчас {title_chars})")
+            if subtitle_chars > MAX_CHARS_SUBTITLE_M_L:
+                final_issues.append(f"Подзаголовок превышает {MAX_CHARS_SUBTITLE_M_L} символов (сейчас {subtitle_chars})")
+
+        # Пересчитываем вердикт
+        final_verdict = "ok" if not final_issues else "error"
+        gpt_result["verdict"] = final_verdict
+        gpt_result["issues"] = final_issues
+
+        if final_verdict == "ok":
+            gpt_result["recommendations"] = ""
+
+        return gpt_result
+
     except Exception as e:
         logger.error(f"YandexGPT error: {e}")
         return None
@@ -241,7 +318,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (улучшенный промпт)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (полная постобработка)...")
     
     application.run_polling(
         read_timeout=30,
