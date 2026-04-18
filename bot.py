@@ -4,9 +4,12 @@ import json
 import base64
 import logging
 import requests
-from PIL import Image, ImageEnhance, ImageFilter
+import numpy as np
+import cv2
+from PIL import Image, ImageEnhance, ImageFilter, ImageStat
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from colorthief import ColorThief
 
 # ---------- НАСТРОЙКА ЛОГИРОВАНИЯ ----------
 logging.basicConfig(
@@ -31,15 +34,99 @@ OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 VISION_CLASSIFY_URL = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
 
-# --- Параметры ---
+# --- Параметры гайдлайнов Пятёрочки ---
 MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt-lite/latest"
 TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
+ASPECT_RATIO = TARGET_WIDTH / TARGET_HEIGHT
+SIZE_TOLERANCE = 0.0
 MAX_FILE_SIZE_MB = 5
+ALLOWED_MIME_TYPES = {'image/jpeg', 'image/png', 'image/jpg'}
+
+TEXT_COLOR_DARK = "#302E33"
+TEXT_COLOR_LIGHT = "#FFFFFF"
+MAX_TEXT_AREA_PERCENT = 52
+
+MIN_SATURATION_ACID = 50
+MAX_LIGHTNESS_PASTEL = 85
+TEXTURE_THRESHOLD = 30
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "pyaterochka_logo.png")
+
 MAX_CHARS_XS_S = 45
 MAX_CHARS_TITLE_M_L = 30
 MAX_CHARS_SUBTITLE_M_L = 55
-SAFETY_THRESHOLD = 0.7  # Порог для определения "небезопасного" контента
+
+SAFETY_THRESHOLD = 0.7
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОВЕРКИ ИЗОБРАЖЕНИЯ ----------
+def rgb_to_hsl(r, g, b):
+    r, g, b = r/255.0, g/255.0, b/255.0
+    mx = max(r, g, b)
+    mn = min(r, g, b)
+    l = (mx + mn) / 2
+    if mx == mn:
+        h = s = 0
+    else:
+        d = mx - mn
+        s = d / (2 - mx - mn) if l > 0.5 else d / (mx + mn)
+        if mx == r:
+            h = (g - b) / d + (6 if g < b else 0)
+        elif mx == g:
+            h = (b - r) / d + 2
+        else:
+            h = (r - g) / d + 4
+        h /= 6
+    return h * 360, s * 100, l * 100
+
+def get_dominant_colors(image, n=3):
+    temp = io.BytesIO()
+    image.save(temp, format='PNG')
+    temp.seek(0)
+    color_thief = ColorThief(temp)
+    palette = color_thief.get_palette(color_count=n)
+    return palette
+
+def is_background_bad(image):
+    img = image.convert('RGB')
+    palette = get_dominant_colors(img, 5)
+    issues = []
+    for rgb in palette:
+        h, s, l = rgb_to_hsl(*rgb)
+        if l < 10:
+            issues.append("чёрный цвет фона")
+        if l > 90 or (l > MAX_LIGHTNESS_PASTEL and s < 20):
+            issues.append("белый/пастельный фон")
+        if s > MIN_SATURATION_ACID and l > 40 and l < 80:
+            issues.append("кислотный цвет фона")
+        if len(palette) >= 3 and all(rgb_to_hsl(*c)[1] > 40 for c in palette[:3]):
+            issues.append("пёстрый фон")
+    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if laplacian_var > TEXTURE_THRESHOLD:
+        issues.append("текстурный фон")
+    return list(set(issues))
+
+def detect_logo_pyaterochka(image):
+    if not os.path.exists(LOGO_TEMPLATE_PATH):
+        return False, "файл шаблона логотипа не найден"
+    img_cv = cv2.cvtColor(np.array(image.convert('RGB')), cv2.COLOR_RGB2BGR)
+    template = cv2.imread(LOGO_TEMPLATE_PATH)
+    if template is None:
+        return False, "не удалось загрузить шаблон логотипа"
+    found = False
+    for scale in np.linspace(0.5, 1.5, 10):
+        resized = cv2.resize(template, (0,0), fx=scale, fy=scale)
+        if resized.shape[0] > img_cv.shape[0] or resized.shape[1] > img_cv.shape[1]:
+            continue
+        res = cv2.matchTemplate(img_cv, resized, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
+        if max_val > 0.7:
+            found = True
+            break
+    return found, "обнаружен логотип Пятёрочки (запрещено)"
 
 def preprocess_image(pil_image: Image.Image) -> Image.Image:
     """Предобработка изображения для улучшения распознавания текста."""
@@ -83,14 +170,12 @@ def check_image_safety(pil_image: Image.Image) -> tuple[bool, str]:
         response.raise_for_status()
         data = response.json()
 
-        # Извлекаем результаты классификации
         results = data.get("results", [])
         if not results:
             return True, ""
         
         properties = results[0].get("results", [{}])[0].get("classification", {}).get("properties", [])
         
-        # Ищем проблемные категории с высокой вероятностью
         for prop in properties:
             if prop.get("probability", 0) > SAFETY_THRESHOLD:
                 category = prop.get("name", "").lower()
@@ -141,7 +226,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     if not ocr_text:
         return {"verdict": "error", "issues": ["Текст не обнаружен."], "recommendations": ""}
 
-    # Подсчитываем символы для проверки лимитов
     char_count = len(ocr_text.strip())
     lines = ocr_text.strip().split('\n')
     title = lines[0] if lines else ''
@@ -149,7 +233,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     title_chars = len(title)
     subtitle_chars = len(subtitle)
 
-    # Определяем тип баннера по количеству символов
     if char_count <= MAX_CHARS_XS_S + 10:
         banner_type = 'xs_s'
         char_limit_msg = f"Общее количество символов: {char_count} (макс. {MAX_CHARS_XS_S} для XS/S)"
@@ -207,7 +290,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         content = result["result"]["alternatives"][0]["message"]["text"]
         logger.info(f"YandexGPT ответ: {content[:200]}...")
 
-        # Парсим JSON
         try:
             start = content.find('{')
             end = content.rfind('}') + 1
@@ -218,11 +300,10 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         except json.JSONDecodeError:
             return {"verdict": "error", "issues": ["Некорректный JSON в ответе"], "recommendations": content}
 
-        # --- ПОСТОБРАБОТКА: исправляем ошибки модели ---
+        # --- ПОСТОБРАБОТКА ---
         issues = gpt_result.get("issues", [])
         corrected_issues = []
 
-        # 1. Проверка восклицательных знаков
         exclamation_count = ocr_text.count('!')
         if exclamation_count <= 1:
             for issue in issues:
@@ -233,11 +314,9 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         else:
             corrected_issues = issues
 
-        # 2. Проверка капса (если модель ошибочно его указала)
         final_issues = []
         for issue in corrected_issues:
             if 'капс' in issue.lower() or 'заглавн' in issue.lower():
-                # Проверяем, действительно ли есть капс (весь текст заглавными или целая строка)
                 has_caps = False
                 for line in ocr_text.split('\n'):
                     if line and line == line.upper() and len(line.strip()) > 3:
@@ -250,7 +329,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
             else:
                 final_issues.append(issue)
 
-        # 3. Проверка лимитов символов
         if banner_type == 'xs_s' and char_count > MAX_CHARS_XS_S:
             final_issues.append(f"Превышен лимит символов: {char_count} (макс. {MAX_CHARS_XS_S})")
         elif banner_type == 'm_l':
@@ -259,7 +337,6 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
             if subtitle_chars > MAX_CHARS_SUBTITLE_M_L:
                 final_issues.append(f"Подзаголовок превышает {MAX_CHARS_SUBTITLE_M_L} символов (сейчас {subtitle_chars})")
 
-        # Пересчитываем вердикт
         final_verdict = "ok" if not final_issues else "error"
         gpt_result["verdict"] = final_verdict
         gpt_result["issues"] = final_issues
@@ -293,8 +370,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
-    if not document.mime_type or not document.mime_type.startswith('image/'):
-        await update.message.reply_text("❌ Пожалуйста, отправьте изображение.")
+    if document.mime_type not in ALLOWED_MIME_TYPES:
+        await update.message.reply_text("❌ Пожалуйста, отправьте изображение в формате JPEG или PNG.")
         return
     await update.message.reply_text("🔍 Анализирую оригинальный файл с помощью Yandex AI...")
     file = await document.get_file()
@@ -317,7 +394,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     size_ok = (width == TARGET_WIDTH and height == TARGET_HEIGHT)
     size_msg = f"📏 Размер: {width}x{height} {'✅' if size_ok else '❌ (ожидается 984x570)'}"
 
-    # 1. Проверяем безопасность изображения
+    # Проверка безопасности
     is_safe, safety_reason = check_image_safety(img_pil)
     if not is_safe:
         lines = [
@@ -331,15 +408,39 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
         await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
         return
 
-    await update.message.reply_text(
-        f"{size_msg}\n🤖 Распознаю текст (с предобработкой)..."
-    )
+    # Проверка фона
+    bg_issues = is_background_bad(img_pil)
+    if bg_issues:
+        issues_str = ", ".join(bg_issues)
+        lines = [
+            f"*Результаты проверки (Yandex AI):*",
+            size_msg,
+            f"\n*Вердикт:* ❌ Баннер имеет нарушения.",
+            f"\n*Обнаруженные проблемы:*",
+            f"• Проблемы с фоном: {issues_str}",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+        return
+
+    # Проверка логотипа
+    logo_found, logo_msg = detect_logo_pyaterochka(img_pil)
+    if logo_found:
+        lines = [
+            f"*Результаты проверки (Yandex AI):*",
+            size_msg,
+            f"\n*Вердикт:* ❌ Баннер имеет нарушения.",
+            f"\n*Обнаруженные проблемы:*",
+            f"• {logo_msg}",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+        return
+
+    await update.message.reply_text(f"{size_msg}\n🤖 Распознаю текст...")
 
     ocr_text = ocr_with_yandex(img_pil)
     if not ocr_text:
         await update.message.reply_text(
-            f"{size_msg}\n❌ Не удалось распознать текст. "
-            "Убедитесь, что текст на баннере хорошо читается."
+            f"{size_msg}\n❌ Не удалось распознать текст. Убедитесь, что текст на баннере хорошо читается."
         )
         return
 
@@ -374,9 +475,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
     if recommendations:
         lines.append(f"\n*Рекомендация:* {recommendations}")
 
-    # Добавляем предупреждение о ручной проверке имиджа (стилистические запреты)
-    lines.append("\n⚠️ *Требуется ручная проверка:* убедитесь, что изображение не содержит оружия, мрачных готических образов или антропоморфизма.")
-
+    lines.append("\n⚠️ *Требуется ручная проверка:* убедитесь, что цвет текста соответствует гайду (#302E33 на светлом фоне или #FFFFFF на тёмном), и что изображение не содержит оружия, мрачных готических образов или антропоморфизма.")
     lines.append(f"\n📝 *Распознанный текст:*\n{ocr_text}")
 
     await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
@@ -392,7 +491,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision OCR + Classification + YandexGPT...")
+    logger.info("Бот запущен с полным набором проверок (фон, логотип, текст, безопасность)...")
     
     application.run_polling(
         read_timeout=30,
