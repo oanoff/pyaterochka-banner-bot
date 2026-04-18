@@ -28,6 +28,8 @@ if not BOT_TOKEN:
 
 OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+# ИСПРАВЛЕНО: правильный modelUri для YandexGPT Lite
+MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt-lite/latest"
 
 TARGET_WIDTH = 984
 TARGET_HEIGHT = 570
@@ -67,30 +69,10 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
         logger.info(f"OCR статус ответа: {response.status_code}")
         response.raise_for_status()
         data = response.json()
-        logger.info(f"OCR ответ (ключи верхнего уровня): {list(data.keys())}")
         
-        # Пытаемся извлечь текст из разных возможных мест
-        text = ""
-        if "result" in data:
-            # Старый формат
-            text = data.get("result", {}).get("textAnnotation", {}).get("fullText", "")
-            logger.info(f"Извлечение из result.textAnnotation.fullText: {text[:100] if text else 'пусто'}")
-        elif "results" in data:
-            # Новый формат (массив)
-            results = data.get("results", [])
-            if results:
-                text_annotation = results[0].get("textAnnotation", {})
-                text = text_annotation.get("fullText", "")
-                logger.info(f"Извлечение из results[0].textAnnotation.fullText: {text[:100] if text else 'пусто'}")
-        elif "textAnnotation" in data:
-            # Плоский формат
-            text = data.get("textAnnotation", {}).get("fullText", "")
-            logger.info(f"Извлечение из textAnnotation.fullText: {text[:100] if text else 'пусто'}")
-        else:
-            logger.error(f"Неизвестная структура ответа OCR: {json.dumps(data, indent=2, ensure_ascii=False)[:500]}")
-        
-        if not text:
-            logger.warning("Текст не найден ни в одном известном поле.")
+        # Извлекаем текст из ответа (поле 'result')
+        text = data.get("result", {}).get("textAnnotation", {}).get("fullText", "")
+        logger.info(f"Извлечённый текст: {text[:100] if text else 'пусто'}")
         return text
     except Exception as e:
         logger.error(f"Yandex Vision OCR error: {e}")
@@ -120,7 +102,7 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
 """
 
     payload = {
-        "modelUri": f"gpt://{FOLDER_ID}/yandexgpt/lite",
+        "modelUri": MODEL_URI,
         "completionOptions": {
             "stream": False,
             "temperature": 0.1,
@@ -139,12 +121,13 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     }
 
     try:
-        logger.info("Отправка текста в YandexGPT...")
+        logger.info(f"Отправка текста в YandexGPT (modelUri: {MODEL_URI})...")
         response = requests.post(GPT_URL, json=payload, headers=headers, timeout=60)
+        logger.info(f"YandexGPT статус ответа: {response.status_code}")
         response.raise_for_status()
         result = response.json()
         content = result["result"]["alternatives"][0]["message"]["text"]
-        logger.info(f"YandexGPT ответ: {content}")
+        logger.info(f"YandexGPT ответ: {content[:200]}...")
         try:
             start = content.find('{')
             end = content.rfind('}') + 1
@@ -222,7 +205,7 @@ async def process_image(update: Update, image_bytes: bytes, is_compressed: bool)
 
     if gpt_result is None:
         await update.message.reply_text(
-            f"{size_msg}\n❌ Ошибка при обращении к YandexGPT. Проверьте настройки."
+            f"{size_msg}\n❌ Ошибка при обращении к YandexGPT. Проверьте настройки или повторите позже."
         )
         return
 
@@ -259,7 +242,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (гибкое извлечение текста)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (исправлен modelUri)...")
     
     application.run_polling(
         read_timeout=30,
