@@ -28,7 +28,6 @@ if not BOT_TOKEN:
 
 OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 GPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-# ИСПРАВЛЕНО: правильный modelUri для YandexGPT Lite
 MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt-lite/latest"
 
 TARGET_WIDTH = 984
@@ -69,8 +68,6 @@ def ocr_with_yandex(pil_image: Image.Image) -> str:
         logger.info(f"OCR статус ответа: {response.status_code}")
         response.raise_for_status()
         data = response.json()
-        
-        # Извлекаем текст из ответа (поле 'result')
         text = data.get("result", {}).get("textAnnotation", {}).get("fullText", "")
         logger.info(f"Извлечённый текст: {text[:100] if text else 'пусто'}")
         return text
@@ -82,22 +79,24 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     if not ocr_text:
         return {"verdict": "error", "issues": ["Текст не обнаружен."], "recommendations": ""}
 
+    # Улучшенный промпт с чёткими правилами и примерами
     system_prompt = """
-Ты — ассистент по проверке баннеров для приложения Пятёрочки.
-Проанализируй предоставленный текст и проверь его на соответствие следующим гайдлайнам:
+Ты — эксперт по проверке текстов для баннеров Пятёрочки. Твоя задача — найти ТОЛЬКО реальные нарушения в предоставленном тексте. Не придумывай ошибок, если их нет. Анализируй строго по следующим правилам:
 
-1. Обращение к пользователю на "Вы".
-2. Конкретное предложение с очевидной пользой, без абстрактных слов (например, "Живите оранжево!").
-3. Использование буквы "ё" (например, "ещё", а не "еще").
-4. Кавычки-ёлочки «».
-5. Отсутствие капса (например, "РОЗЫГРЫШ" — ошибка).
-6. Не более одного восклицательного знака.
+1. Обращение к пользователю на "Вы". Нарушение: обращение на "ты" ("получи", "купи").
+2. Конкретное предложение с очевидной пользой, без абстрактных слов. Нарушение: фразы вроде "Живите оранжево!", "Больше орехов, больше призов!".
+3. Использование буквы "ё". Нарушение: "еще" вместо "ещё", "пятерочка" вместо "пятёрочка".
+4. Кавычки-ёлочки «». Нарушение: использование "прямых" или “английских” кавычек.
+5. Отсутствие капса. Нарушение: КОГДА ВЕСЬ ТЕКСТ ИЛИ ЗАГОЛОВОК НАБРАН ЗАГЛАВНЫМИ БУКВАМИ. Отдельные заглавные буквы в начале слов и аббревиатуры (например, "VIP") НЕ ЯВЛЯЮТСЯ нарушением.
+6. Не более одного восклицательного знака на весь текст. Нарушение: два и более "!" в любом месте.
 
-Верни ответ строго в формате JSON:
+ВАЖНО: Если восклицательный знак один — это НЕ нарушение. Если капс отсутствует — это НЕ нарушение.
+
+Верни ответ строго в формате JSON без дополнительного текста:
 {
   "verdict": "ok" или "error",
   "issues": ["список", "конкретных", "нарушений"],
-  "recommendations": "краткая рекомендация по исправлению"
+  "recommendations": "краткая рекомендация по исправлению (если есть нарушения)"
 }
 """
 
@@ -105,12 +104,12 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
         "modelUri": MODEL_URI,
         "completionOptions": {
             "stream": False,
-            "temperature": 0.1,
+            "temperature": 0.0,  # нулевая температура для максимальной точности
             "maxTokens": 1000
         },
         "messages": [
             {"role": "system", "text": system_prompt},
-            {"role": "user", "text": f"Проверь этот текст: {ocr_text}"}
+            {"role": "user", "text": f"Проверь этот текст:\n{ocr_text}"}
         ]
     }
 
@@ -121,7 +120,7 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
     }
 
     try:
-        logger.info(f"Отправка текста в YandexGPT (modelUri: {MODEL_URI})...")
+        logger.info(f"Отправка текста в YandexGPT...")
         response = requests.post(GPT_URL, json=payload, headers=headers, timeout=60)
         logger.info(f"YandexGPT статус ответа: {response.status_code}")
         response.raise_for_status()
@@ -134,9 +133,9 @@ def analyze_text_with_yandexgpt(ocr_text: str) -> dict | None:
             if start != -1 and end > start:
                 return json.loads(content[start:end])
             else:
-                return {"verdict": "error", "issues": ["Не удалось разобрать ответ"], "recommendations": content}
+                return {"verdict": "error", "issues": ["Не удалось разобрать ответ модели"], "recommendations": content}
         except json.JSONDecodeError:
-            return {"verdict": "error", "issues": ["Некорректный JSON"], "recommendations": content}
+            return {"verdict": "error", "issues": ["Некорректный JSON в ответе"], "recommendations": content}
     except Exception as e:
         logger.error(f"YandexGPT error: {e}")
         return None
@@ -242,7 +241,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
     application.add_error_handler(error_handler)
-    logger.info("Бот запущен с Yandex Vision + YandexGPT (исправлен modelUri)...")
+    logger.info("Бот запущен с Yandex Vision + YandexGPT (улучшенный промпт)...")
     
     application.run_polling(
         read_timeout=30,
